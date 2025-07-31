@@ -1,0 +1,12 @@
+# Python virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Recordings folder
+recordings/
+
+# YOLO model file (optional, if you download it separately)
+# *.pt
