@@ -73,10 +73,6 @@ class Camera:
         self.latest_detections = []
         self.monitoring_active = False # Start with monitoring ON by default
 
-        self.last_frame_time = time.time()
-        self.fps = 0.0
-        self.fps_lock = threading.Lock()
-
     def start(self):
         """Initializes and starts the camera with a stable configuration."""
         print("\n--- Initializing Camera System ---")
@@ -106,13 +102,6 @@ class Camera:
         """Captures hi-res frames, manages the pre-record buffer, and feeds the recording queue."""
         while self.running:
             try:
-                # Calculate FPS
-                current_time = time.time()
-                with self.fps_lock:
-                    if current_time != self.last_frame_time:
-                        self.fps = 1.0 / (current_time - self.last_frame_time)
-                    self.last_frame_time = current_time
-
                 main_frame = self.picam2.capture_array("main")
                 
                 with self.lock:
@@ -136,9 +125,10 @@ class Camera:
     def _processing_loop(self):
         """Independently captures lo-res frames to detect motion and manage state."""
         prev_lores_gray = None
+        frame_count = 0
         while self.running:
             try:
-                # If monitoring is off, skip all processing.
+                # [NEW] If monitoring is off, skip all processing.
                 if not self.monitoring_active:
                     # Clear any old detections so they don't stay on screen.
                     if self.latest_detections:
@@ -146,24 +136,37 @@ class Camera:
                     time.sleep(0.1)
                     continue
 
+                # --- The rest of the processing logic is now nested under the active check ---
                 lores_frame = self.picam2.capture_array("lores")
+                
                 lores_gray = lores_frame[0:LORES_HEIGHT, 0:LORES_WIDTH]
                 lores_gray = cv2.GaussianBlur(lores_gray, (15, 15), 0)
                 if prev_lores_gray is None:
                     prev_lores_gray = lores_gray
                     continue
-    
+                
                 frame_delta = cv2.absdiff(prev_lores_gray, lores_gray)
                 thresh = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)[1]
                 motion_detected = cv2.countNonZero(thresh) > MOTION_THRESHOLD
                 prev_lores_gray = lores_gray
- 
+
                 if motion_detected:
                     self.last_motion_time = time.time()
                     if self.state == State.IDLE:
-                        print("✔️ Motion detected. Starting recording.")
-                        self._start_recording()
+                        frame_count += 1
+                        if frame_count % YOLO_FRAME_INTERVAL == 0:
+                            with self.lock:
+                                yolo_frame = self.pre_record_buffer[-1].copy() if self.pre_record_buffer else None
+                            
+                            if yolo_frame is not None:
+                                results = self.model(yolo_frame, conf=YOLO_CONFIDENCE, verbose=False)
+                                self.latest_detections = results
+                                detected_classes = [self.model.names[int(box.cls)] for r in results for box in r.boxes]
 
+                                if detected_classes and not any(cls in TARGET_CLASSES_TO_IGNORE for cls in detected_classes):
+                                    print(f"✔️ Validated motion: {detected_classes}. Starting recording.")
+                                    self._start_recording()
+                
                 elif self.state == State.RECORDING:
                     time_since_start = time.time() - self.recording_start_time
                     time_since_last_motion = time.time() - self.last_motion_time
@@ -176,6 +179,7 @@ class Camera:
                 print(f"Error in motion detection loop: {e}")
                 self.running = False
         print("Motion detection loop has stopped.")
+
 
     def _start_recording(self):
         """Changes state and starts the recording thread."""
@@ -259,15 +263,6 @@ class Camera:
             cv2.putText(annotated_frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
 
         cv2.putText(annotated_frame, time.strftime("%Y-%m-%d %H:%M:%S"), (10, FRAME_HEIGHT - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-        # Add timestamp and FPS
-        with self.fps_lock:
-            fps_text = f"{self.fps:.1f} FPS"
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        combined_text = f"{timestamp} | {fps_text}"
-        cv2.putText(annotated_frame, combined_text, (10, FRAME_HEIGHT - 10), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
         return annotated_frame
 
     def get_jpeg_frame(self):

@@ -1,3 +1,4 @@
+
 import cv2
 import time
 import os
@@ -14,28 +15,34 @@ sys.modules['pykms'] = Mock()
 
 from picamera2.picamera2 import Picamera2
 import libcamera
+from libcamera import controls
 from enum import Enum
+
 
 class State(Enum):
     IDLE = 0
     RECORDING = 1
 
 
+# --- Constants ---
 FRAMERATE = 60
-FRAME_WIDTH = 1080 #1920 #1080
-FRAME_HEIGHT = 720 #1080 #720
+FRAME_WIDTH = 1080
+FRAME_HEIGHT = 720
 JPEG_QUALITY = 85
 LORES_WIDTH = 320
 LORES_HEIGHT = 240
 SAVE_DIR = 'recordings'
-MOTION_THRESHOLD = 20
-YOLO_CONFIDENCE = 0.51
-YOLO_FRAME_INTERVAL = 2
-POST_MOTION_RECORD_SECONDS = 5.0
-MIN_RECORD_TIME_SECONDS = 10.0 
-PRE_RECORD_SECONDS = 5
+MOTION_THRESHOLD = 200
+YOLO_CONFIDENCE = 0.3
+POST_MOTION_RECORD_SECONDS = 2.0
+MIN_RECORD_TIME_SECONDS = 4.0
+PRE_RECORD_SECONDS = 2
 PRE_RECORD_FRAMES = FRAMERATE * PRE_RECORD_SECONDS
-TARGET_CLASSES_TO_IGNORE = []#['bird', 'airplane','insect']
+TARGET_CLASSES_TO_IGNORE = [] #['bird', 'airplane', 'insect']
+# [FIX] Define the missing constant for how often to run YOLO on the live feed
+YOLO_FRAME_INTERVAL = 1 # Higher number is less frequent (e.g., runs on 1 out of every FRAMERATE/2 frames)
+YOLO_VIDEO_ANALYSIS_INTERVAL_SECONDS = 0.1
+
 
 class Camera:
     """
@@ -43,6 +50,7 @@ class Camera:
     - High-res thread captures frames for streaming and recording.
     - Low-res thread independently handles motion detection.
     - A dedicated queue ensures no frames are dropped during recording.
+    - A post-processing step analyzes videos and renames them with descriptive tags.
     """
 
     def __init__(self):
@@ -66,27 +74,45 @@ class Camera:
         self.last_motion_time = 0
         self.recording_start_time = 0
         self.video_writer = None
+        self.current_recording_path = None 
 
         # Stream Management
         self.stream_paused_event = threading.Event()
         self.latest_frame_for_stream = None
         self.latest_detections = []
-        self.monitoring_active = False # Start with monitoring ON by default
+        self.monitoring_active = False # Start with monitoring OFF by default
+
+        # FPS calculation
+        self.last_frame_time = time.time()
+        self.fps = 0.0
+        self.fps_lock = threading.Lock()
 
     def start(self):
-        """Initializes and starts the camera with a stable configuration."""
+        """[MODIFIED] Initializes and starts the camera with auto-exposure controls."""
         print("\n--- Initializing Camera System ---")
         try:
             self.picam2 = Picamera2()
             config = self.picam2.create_video_configuration(
                 main={"size": (FRAME_WIDTH, FRAME_HEIGHT), "format": "BGR888"},
                 lores={"size": (LORES_WIDTH, LORES_HEIGHT), "format": "YUV420"},
-                controls={"FrameRate": FRAMERATE}
+                controls={
+                    "FrameRate": FRAMERATE,
+                    "AeEnable": True,
+                    "AwbEnable": True,
+                    "ExposureValue": 0.5,
+                    
+                    # [FIX] Use the correct camera constant (enum) for AeMeteringMode.
+                    "AeMeteringMode": controls.AeMeteringModeEnum.Matrix,
+                    
+                    # You can still experiment with other modes like this:
+                    # "AeMeteringMode": controls.AeMeteringModeEnum.Centre,
+                    # "AeMeteringMode": controls.AeMeteringModeEnum.Spot,
+                }
             )
             self.picam2.configure(config)
             self.picam2.start()
-            time.sleep(1.0)
-            print("[SUCCESS] picamera2 started successfully.")
+            time.sleep(1.0) # Allow time for camera algorithms to settle
+            print("[SUCCESS] picamera2 started successfully with auto-exposure controls.")
         except Exception as e:
             print(f"[FAIL] Failed to initialize picamera2: {e}")
             self.running = False
@@ -102,17 +128,20 @@ class Camera:
         """Captures hi-res frames, manages the pre-record buffer, and feeds the recording queue."""
         while self.running:
             try:
+                current_time = time.time()
+                with self.fps_lock:
+                    if current_time != self.last_frame_time:
+                        self.fps = 1.0 / (current_time - self.last_frame_time)
+                    self.last_frame_time = current_time
+
                 main_frame = self.picam2.capture_array("main")
                 
                 with self.lock:
-                    # Always keep the pre-record buffer updated.
                     self.pre_record_buffer.append(main_frame)
                     
-                    # If we are recording, also put the frame into the dedicated recording queue.
                     if self.state == State.RECORDING:
                         self.recording_queue.put(main_frame)
                 
-                # Annotate and update the frame for the live stream.
                 annotated_frame = self._get_annotated_frame(main_frame, draw_status=True)
                 with self.lock:
                     self.latest_frame_for_stream = annotated_frame
@@ -125,48 +154,43 @@ class Camera:
     def _processing_loop(self):
         """Independently captures lo-res frames to detect motion and manage state."""
         prev_lores_gray = None
-        frame_count = 0
+        frame_counter = 0
+
         while self.running:
             try:
-                # [NEW] If monitoring is off, skip all processing.
                 if not self.monitoring_active:
-                    # Clear any old detections so they don't stay on screen.
                     if self.latest_detections:
                         self.latest_detections = []
                     time.sleep(0.1)
                     continue
 
-                # --- The rest of the processing logic is now nested under the active check ---
                 lores_frame = self.picam2.capture_array("lores")
-                
                 lores_gray = lores_frame[0:LORES_HEIGHT, 0:LORES_WIDTH]
                 lores_gray = cv2.GaussianBlur(lores_gray, (15, 15), 0)
                 if prev_lores_gray is None:
                     prev_lores_gray = lores_gray
                     continue
-                
+        
                 frame_delta = cv2.absdiff(prev_lores_gray, lores_gray)
                 thresh = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)[1]
                 motion_detected = cv2.countNonZero(thresh) > MOTION_THRESHOLD
                 prev_lores_gray = lores_gray
 
+                # Run YOLO detection periodically on the main thread for live view
+                frame_counter += 1
+                # [FIX] Use the now-defined YOLO_FRAME_INTERVAL constant
+                if frame_counter % (FRAMERATE // YOLO_FRAME_INTERVAL) == 0:
+                    main_frame_for_yolo = self.picam2.capture_array("main")
+                    results = self.model.predict(main_frame_for_yolo, conf=YOLO_CONFIDENCE, verbose=False)
+                    with self.lock:
+                        self.latest_detections = results
+
                 if motion_detected:
                     self.last_motion_time = time.time()
                     if self.state == State.IDLE:
-                        frame_count += 1
-                        if frame_count % YOLO_FRAME_INTERVAL == 0:
-                            with self.lock:
-                                yolo_frame = self.pre_record_buffer[-1].copy() if self.pre_record_buffer else None
-                            
-                            if yolo_frame is not None:
-                                results = self.model(yolo_frame, conf=YOLO_CONFIDENCE, verbose=False)
-                                self.latest_detections = results
-                                detected_classes = [self.model.names[int(box.cls)] for r in results for box in r.boxes]
+                        print("✔️ Motion detected. Starting recording.")
+                        self._start_recording()
 
-                                if detected_classes and not any(cls in TARGET_CLASSES_TO_IGNORE for cls in detected_classes):
-                                    print(f"✔️ Validated motion: {detected_classes}. Starting recording.")
-                                    self._start_recording()
-                
                 elif self.state == State.RECORDING:
                     time_since_start = time.time() - self.recording_start_time
                     time_since_last_motion = time.time() - self.last_motion_time
@@ -176,16 +200,18 @@ class Camera:
                 time.sleep(0.01)
 
             except Exception as e:
-                print(f"Error in motion detection loop: {e}")
+                print(f"Error in processing loop: {e}")
                 self.running = False
-        print("Motion detection loop has stopped.")
-
+        print("Processing loop has stopped.")
 
     def _start_recording(self):
-        """Changes state and starts the recording thread."""
+        """Prepares filename, changes state, and starts the recording thread."""
         with self.lock:
             if self.state == State.RECORDING: return
             
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            self.current_recording_path = os.path.join(SAVE_DIR, f"motion_{timestamp}.mp4")
+
             self.recording_start_time = time.time()
             self.last_motion_time = time.time()
             self.state = State.RECORDING
@@ -199,48 +225,106 @@ class Camera:
             self.recording_thread.start()
 
     def _stop_recording(self):
-        """[FIX] This method is now included. It stops the recording and waits for the thread to finish."""
+        """Stops recording and triggers the asynchronous video analysis."""
+        path_to_analyze = None
         with self.lock:
             if self.state == State.IDLE: return
             print("Stopping recording and finalizing video file...")
             self.state = State.IDLE
+            path_to_analyze = self.current_recording_path
         
         if self.recording_thread and self.recording_thread.is_alive():
             print("Waiting for recording thread to finish writing frames...")
             self.recording_thread.join()
             print("Recording thread finished.")
         
+        if path_to_analyze:
+            print(f"Queueing video for analysis: {os.path.basename(path_to_analyze)}")
+            analysis_thread = threading.Thread(
+                target=self._analyze_and_rename_video,
+                args=(path_to_analyze,),
+                daemon=True
+            )
+            analysis_thread.start()
+        
         self.stream_paused_event.clear()
+        self.current_recording_path = None
 
     def _recording_loop(self):
-        """A simple, robust consumer that writes frames from the queue to a video file."""
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        out_path = os.path.join(SAVE_DIR, f"motion_{timestamp}.mp4")
+        """Writes frames from the queue to the video file, with correct color space."""
+        out_path = self.current_recording_path
+        if not out_path:
+            print("[Error] Recording loop started without a valid output path.")
+            return
+
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         self.video_writer = cv2.VideoWriter(out_path, fourcc, float(FRAMERATE), (FRAME_WIDTH, FRAME_HEIGHT))
         
         print(f"Recording to {out_path}...")
         while self.state == State.RECORDING or not self.recording_queue.empty():
             try:
-                # Get the BGR frame from the queue
                 frame_bgr = self.recording_queue.get(timeout=1)
-                
-                # Annotate the BGR frame
                 annotated_frame_bgr = self._get_annotated_frame(frame_bgr, draw_status=False)
                 
-                # [FIX] Convert the final annotated frame to RGB for the video encoder.
+                # [FIX] Convert BGR to RGB for correct colors in the saved MP4 file.
                 frame_to_write_rgb = cv2.cvtColor(annotated_frame_bgr, cv2.COLOR_BGR2RGB)
-                
                 self.video_writer.write(frame_to_write_rgb)
-
+                
             except queue.Empty:
-                # This can happen if the state changes right as the queue empties.
                 break
         
         if self.video_writer:
             self.video_writer.release()
             self.video_writer = None
         print(f"Video saved: {out_path}")
+
+    def _analyze_and_rename_video(self, video_path):
+        """Opens a completed video, runs YOLO detection, and renames the file with tags."""
+        if not video_path or not os.path.exists(video_path):
+            print(f"[Analysis] Video path not found or invalid: {video_path}")
+            return
+
+        print(f"[Analysis] Starting analysis for {os.path.basename(video_path)}...")
+        detected_objects = set()
+        try:
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                print(f"[Analysis] Error: Could not open video file {video_path}")
+                return
+
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_interval = int(fps * YOLO_VIDEO_ANALYSIS_INTERVAL_SECONDS)
+            if frame_interval < 1: frame_interval = 1 
+
+            frame_number = 0
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                if frame_number % frame_interval == 0:
+                    results = self.model.predict(frame, conf=YOLO_CONFIDENCE, verbose=False)
+                    for r in results:
+                        for box in r.boxes:
+                            class_name = self.model.names[int(box.cls)]
+                            if class_name not in TARGET_CLASSES_TO_IGNORE:
+                                detected_objects.add(class_name)
+                frame_number += 1
+            
+            cap.release()
+
+            if detected_objects:
+                tags = "_".join(sorted(list(detected_objects)))
+                path_without_ext, ext = os.path.splitext(video_path)
+                new_path = f"{path_without_ext}_{tags}{ext}"
+                
+                os.rename(video_path, new_path)
+                print(f"[Analysis] Success! Renamed video to: {os.path.basename(new_path)}")
+            else:
+                print("[Analysis] No relevant objects detected to add tags.")
+
+        except Exception as e:
+            print(f"[Analysis] An error occurred during video analysis: {e}")
 
     def _get_annotated_frame(self, frame, draw_status=False):
         """Draws annotations on a copy of the frame."""
@@ -256,45 +340,22 @@ class Camera:
                     cv2.putText(annotated_frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
         if draw_status:
-            status_text, color = (f"Monitoring Status:{self.monitoring_active}", (0, 255, 0))
+            status_text = f"Monitoring: {'ON' if self.monitoring_active else 'OFF'}"
+            color = (0, 255, 0) if self.monitoring_active else (100, 100, 100)
             if self.state == State.RECORDING:
                 status_text, color = "Status: RECORDING", (0, 0, 255)
-            # You could add another state/flag for "motion detected" if desired
             cv2.putText(annotated_frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
 
-        cv2.putText(annotated_frame, time.strftime("%Y-%m-%d %H:%M:%S"), (10, FRAME_HEIGHT - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        with self.fps_lock:
+            fps_text = f"{self.fps:.1f} FPS"
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        combined_text = f"{timestamp} | {fps_text}"
+        cv2.putText(annotated_frame, combined_text, (10, FRAME_HEIGHT - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
         return annotated_frame
 
     def get_jpeg_frame(self):
-        """Encodes the latest streamable frame into a JPEG."""
-        with self.lock:
-            if self.latest_frame_for_stream is None:
-                frame = np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
-                cv2.putText(frame, "Initializing...", (int(FRAME_WIDTH/2)-100, int(FRAME_HEIGHT/2)), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-            else:
-                frame = self.latest_frame_for_stream
-        
-        ret, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-        return buffer.tobytes() if ret else None
-
-    def stop(self):
-        """Stops all threads and releases the camera."""
-        print("--- Shutting Down Camera System ---")
-        self.running = False
-        
-        if self.capture_thread.is_alive(): self.capture_thread.join(timeout=2)
-        if self.processing_thread.is_alive(): self.processing_thread.join(timeout=2)
-        
-        if self.state == State.RECORDING:
-             self._stop_recording()
-
-        if self.picam2:
-            self.picam2.stop()
-            print("picamera2 stopped.")
-        print("Camera system stopped.")
-
-    def get_jpeg_frame(self):
-        """Encodes the latest streamable frame into a JPEG, fixing the color space."""
+        """[FIX] Encodes the latest streamable frame into a JPEG with correct color space."""
         with self.lock:
             if self.latest_frame_for_stream is None:
                 frame_bgr = np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
@@ -313,11 +374,9 @@ class Camera:
         print("--- Shutting Down Camera System ---")
         self.running = False
         
-        # Wait for threads to finish their current loop
         if self.capture_thread.is_alive(): self.capture_thread.join(timeout=2)
         if self.processing_thread.is_alive(): self.processing_thread.join(timeout=2)
         
-        # The stop_recording logic handles joining the recording thread
         if self.state == State.RECORDING:
              self._stop_recording()
 
@@ -335,10 +394,15 @@ class Camera:
         """Disables motion detection and automatic recording."""
         print("Monitoring has been DISABLED by user.")
         self.monitoring_active = False
-        # When monitoring is turned off, also stop any recording that might be in progress.
-        self._stop_recording()
+        if self.state == State.RECORDING:
+            self._stop_recording()
+
 
 #------------------------------------------
+# The Flask app part of the code remains the same.
+# It will automatically pick up the renamed files when the page is refreshed.
+#------------------------------------------
+
 app = Flask(__name__)
 camera = Camera()
 
@@ -349,9 +413,11 @@ def index():
     if os.path.exists(SAVE_DIR):
         all_files = [f for f in os.listdir(SAVE_DIR) if f.endswith('.mp4')]
         try:
+            # Sort by modification time to show newest first
             all_files.sort(key=lambda f: os.path.getmtime(os.path.join(SAVE_DIR, f)), reverse=True)
         except FileNotFoundError:
-            print("A recording was deleted while generating the list. Refreshing.")
+            # This can happen if a file is deleted/renamed by the analysis thread while sorting
+            print("A file was changed during list generation. Refreshing list.")
             all_files = [f for f in os.listdir(SAVE_DIR) if f.endswith('.mp4')]
             all_files.sort(key=lambda f: os.path.getmtime(os.path.join(SAVE_DIR, f)), reverse=True)
         recordings = all_files
@@ -370,7 +436,6 @@ def index():
             '''
         recordings_html += '</ul>'
 
-    # [UPDATED] Logic now checks the 'monitoring_active' flag
     if camera.monitoring_active:
         controls_html = f'''
             <form action="/stop_monitoring" method="POST">
@@ -386,7 +451,6 @@ def index():
             <p>Status: Monitoring is OFF.</p>
         '''
 
-    # The rest of the HTML structure remains the same as before.
     return f'''
     <html>
         <head>
@@ -433,42 +497,29 @@ def index():
     '''
 
 def generate_frames_for_stream(cam):
-    # Create a static "Recording..." placeholder frame once
     placeholder = np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
-    placeholder[:] = (68, 68, 68) # A dark gray background (BGR format)
+    placeholder[:] = (68, 68, 68) # BGR
     text = "RECORDING IN PROGRESS"
     text_size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1, 2)
     text_x = (FRAME_WIDTH - text_size[0]) // 2
     text_y = (FRAME_HEIGHT + text_size[1]) // 2
     cv2.putText(placeholder, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-
     ret, placeholder_buffer = cv2.imencode('.jpg', placeholder, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-    if not ret:
-        print("Error: Could not encode the placeholder image!")
-        # Create a tiny fallback placeholder to avoid crashing the stream
-        placeholder_bytes = b''
-    else:
-        placeholder_bytes = placeholder_buffer.tobytes()
-
+    placeholder_bytes = placeholder_buffer.tobytes() if ret else b''
 
     while True:
-        # Check if the stream should be paused
         if cam.stream_paused_event.is_set():
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + placeholder_bytes + b'\r\n')
-            time.sleep(0.5) # Send the placeholder every half second
+            time.sleep(0.5)
             continue
 
-        # If not paused, stream normally
         frame_bytes = cam.get_jpeg_frame()
         if frame_bytes:
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-
-        # A small sleep to prevent the web stream from overwhelming the client
+        
         time.sleep(1 / (FRAMERATE * 2))
-
-
 
 @app.route('/video_feed')
 def video_feed():
@@ -476,17 +527,12 @@ def video_feed():
 
 @app.route('/recordings/<path:filename>')
 def serve_recording(filename):
-    """Serves a recorded video file from the recordings directory."""
     return send_from_directory(SAVE_DIR, filename)
 
-# New route to handle deleting video files
 @app.route('/delete/<path:filename>', methods=['POST'])
 def delete_recording(filename):
-    """Deletes a recorded video file."""
     try:
-        # Security: ensure the filename is safe and only targets the recordings directory
         file_path = os.path.join(SAVE_DIR, filename)
-        # Check that the resolved path is still within the SAVE_DIR
         if os.path.commonprefix((os.path.realpath(file_path), os.path.realpath(SAVE_DIR))) != os.path.realpath(SAVE_DIR):
              return "Invalid filename.", 400
 
@@ -499,18 +545,15 @@ def delete_recording(filename):
         print(f"Error deleting file {filename}: {e}")
         return "Error deleting file.", 500
 
-    # Redirect back to the main page to see the updated list
     return redirect(url_for('index'))
 
 @app.route('/start_monitoring', methods=['POST'])
 def start_monitoring():
-    """Endpoint to enable monitoring."""
     camera.start_monitoring()
     return redirect(url_for('index'))
 
 @app.route('/stop_monitoring', methods=['POST'])
 def stop_monitoring():
-    """Endpoint to disable monitoring."""
     camera.stop_monitoring()
     return redirect(url_for('index'))
 
@@ -526,3 +569,5 @@ if __name__ == '__main__':
         print("\nCaught KeyboardInterrupt, shutting down.")
     finally:
         camera.stop()
+
+
