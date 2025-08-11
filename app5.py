@@ -25,11 +25,11 @@ class State(Enum):
 
 # --- Constants ---
 FRAMERATE = 60
-FRAME_WIDTH = 1080
-FRAME_HEIGHT = 720
-JPEG_QUALITY = 85
-LORES_WIDTH = 320
-LORES_HEIGHT = 240
+FRAME_WIDTH = 1920
+FRAME_HEIGHT = 1080
+JPEG_QUALITY = 95
+LORES_WIDTH = 640
+LORES_HEIGHT = 480
 SAVE_DIR = 'recordings'
 MOTION_THRESHOLD = 125
 YOLO_CONFIDENCE = 0.5
@@ -44,8 +44,8 @@ YOLO_VIDEO_ANALYSIS_INTERVAL_SECONDS = 0.1
 # [NEW] Add new constants for night mode control
 NIGHT_MODE_GAIN_THRESHOLD = 7.0 
 DAY_MODE_GAIN_THRESHOLD = 6.0  # Lowered slightly to prevent flickering
-NIGHT_EXPOSURE_SECONDS = 1   
-NIGHT_ANALOGUE_GAIN = 16.0   
+NIGHT_EXPOSURE_SECONDS = 1
+NIGHT_ANALOGUE_GAIN = 14.0
 
 class Camera:
     """
@@ -230,8 +230,8 @@ class Camera:
         thresh = cv2.dilate(thresh, None, iterations=2)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        min_area = 50   # Ignore small noise
-        max_area = 12000 # Ignore large objects like clouds
+        min_area = 5   # Ignore small noise
+        max_area = 6000 # Ignore large objects like clouds
         
         for c in contours:
             area = cv2.contourArea(c)
