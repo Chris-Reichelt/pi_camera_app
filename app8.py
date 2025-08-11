@@ -41,11 +41,26 @@ TARGET_CLASSES_TO_IGNORE = [] #['bird', 'airplane', 'insect']
 YOLO_FRAME_INTERVAL = 1 
 YOLO_VIDEO_ANALYSIS_INTERVAL_SECONDS = 0.1
 
-# [NEW] Add new constants for night mode control
+# Add new constants for night mode control
 NIGHT_MODE_GAIN_THRESHOLD = 7.0 
 DAY_MODE_GAIN_THRESHOLD = 6.0  # Lowered slightly to prevent flickering
 NIGHT_EXPOSURE_SECONDS = 1
 NIGHT_ANALOGUE_GAIN = 14.0
+
+# --- Day/Sky motion detection tuning ---
+MOG_HISTORY = 300            # frames remembered by background model
+MOG_VAR_THRESH = 12          # sensitivity to foreground (lower = more sensitive)
+MOG_LEARN_RATE = 0.0025       # how fast background adapts (0.001–0.01)
+EDGE_THRESH = 18             # Laplacian edge threshold (15–25)
+EDGE_DENSITY_MIN = 0.2      # min fraction of edge pixels inside a blob (rejects cloud mush)
+DAY_AREA_MIN = 5           # min blob area in lores pixels (ignore specks)
+DAY_AREA_MAX = 3000          # max blob area (reject huge cloud chunks)
+GLOBAL_CHANGE_REJECT = 0.02  # if >8% of frame changes, treat as weather (ignore)
+
+# NEW: speed & persistence gates
+MIN_SPEED_PX = 2           # min centroid speed (pixels/frame at lores)
+PERSIST_FRAMES = 2           # require this many consecutive speed hits
+MIN_LOCAL_CONTRAST = 10.0    # reject very flat/washed-out cloud blobs
 
 class Camera:
     """
@@ -88,7 +103,9 @@ class Camera:
         self.monitoring_active = False 
         self.is_night_mode = False 
         self.latest_lores_gray = None
-
+        self.bg_day = cv2.createBackgroundSubtractorMOG2(history=MOG_HISTORY, varThreshold=MOG_VAR_THRESH, detectShadows=False)
+        self._prev_centroids = []               # [(x,y,t), ...] from last frame
+        self._persist_hits = 0                  # consecutive frames that passed speed gate
 
         # FPS calculation
         self.last_frame_time = time.time()
@@ -188,13 +205,13 @@ class Camera:
                 main_frame = request.make_array("main")
                 lores_frame = request.make_array("lores")
                 lores_gray = lores_frame[0:LORES_HEIGHT, 0:LORES_WIDTH]  # Y from YUV420
+                request.release()
 
                 with self.lock:
                     self.pre_record_buffer.append(main_frame)
                     if self.state == State.RECORDING:
                         self.recording_queue.put(main_frame)
                     self.latest_lores_gray = lores_gray.copy()
-                request.release()
                 
                 with self.lock:
                     self.pre_record_buffer.append(main_frame)
@@ -352,43 +369,106 @@ class Camera:
         time.sleep(0.3)
         self.picam2.set_controls({"AeEnable": True, "AwbEnable": True, "FrameRate": FRAMERATE})
         self.is_night_mode = False
+        self.bg_day = cv2.createBackgroundSubtractorMOG2(history=MOG_HISTORY, varThreshold=MOG_VAR_THRESH, detectShadows=False)
         time.sleep(0.7)  # let AE converge
 
     def _day_mode_motion_detection(self):
         """
-        Detects motion in day mode using contour analysis to ignore large, slow-moving objects like clouds.
+        Sky-only detector that rejects clouds by combining:
+          - MOG2 background (absorbs slow/broad cloud drift)
+          - Edge-density + local contrast (birds/planes are 'edgy' & higher contrast)
+          - Global-change reject (weather sweeps)
+          - Speed + short persistence (cloud fragments move too slowly)
+          - (Optional) YOLO confirm on the ROI
         """
+        # Get the latest lo-res gray frame
         with self.lock:
-            lores_gray = None if self.latest_lores_gray is None else self.latest_lores_gray.copy()
-        if lores_gray is None:
+            lo = None if self.latest_lores_gray is None else self.latest_lores_gray.copy()
+            full_for_yolo = None if self.latest_frame_for_stream is None else self.latest_frame_for_stream.copy()
+        if lo is None:
             return False
 
-        if not hasattr(self, 'prev_lores_day_gray'):
-            self.prev_lores_day_gray = cv2.GaussianBlur(lores_gray, (15, 15), 0)
+        h, w = lo.shape[:2]
+
+        # Pre-smooth to reduce cloud texture
+        lo_blur = cv2.GaussianBlur(lo, (7, 7), 0)
+
+        # --- Foreground via MOG2 dynamic background
+        fg = self.bg_day.apply(lo_blur, learningRate=MOG_LEARN_RATE)
+        fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+        fg = cv2.dilate(fg, None, iterations=1)
+
+        # Reject sweeping global change (weather)
+        if cv2.countNonZero(fg) > int(GLOBAL_CHANGE_REJECT * w * h):
+            self._persist_hits = 0
+            self._prev_centroids = []
             return False
 
-        lores_gray = cv2.GaussianBlur(lores_gray, (15, 15), 0) #--------
+        # --- Edge mask (compact aerial targets are edge-dense)
+        lap = cv2.Laplacian(lo_blur, cv2.CV_16S, ksize=3)
+        lap = cv2.convertScaleAbs(lap)
+        _, edges = cv2.threshold(lap, EDGE_THRESH, 255, cv2.THRESH_BINARY)
 
-        frame_delta = cv2.absdiff(self.prev_lores_day_gray, lores_gray)
-        self.prev_lores_day_gray = lores_gray
+        # Candidate = foreground ∩ edges
+        candidate = cv2.bitwise_and(fg, edges)
 
-        thresh = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)[1]
-        
-        # Use a dilate operation to close gaps in contours
-        thresh = cv2.dilate(thresh, None, iterations=2)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(candidate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        passed_any = False
+        centroids_this = []
 
-        min_area = 5   # Ignore small noise
-        max_area = 6000 # Ignore large objects like clouds
-        
         for c in contours:
             area = cv2.contourArea(c)
-            if min_area < area < max_area:
-                # You can add more checks here, e.g., for aspect ratio or speed
-                print(f"Day motion detected with contour area: {area}")
-                return True
-        
-        return False
+            if area < DAY_AREA_MIN or area > DAY_AREA_MAX:
+                continue
+
+            # Edge density inside blob (kills soft cloud tufts)
+            mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.drawContours(mask, [c], -1, 255, thickness=cv2.FILLED)
+            edge_pixels = cv2.countNonZero(cv2.bitwise_and(edges, mask))
+            edge_density = edge_pixels / float(area + 1e-6)
+            if edge_density < EDGE_DENSITY_MIN:
+                continue
+
+            # Local contrast inside blob (flat clouds -> low stddev)
+            blob_pixels = cv2.bitwise_and(lo_blur, lo_blur, mask=mask)
+            mean, stddev = cv2.meanStdDev(blob_pixels, mask=mask)
+            if float(stddev[0]) < MIN_LOCAL_CONTRAST:
+                continue
+
+            # Centroid for speed gate
+            M = cv2.moments(c)
+            if M["m00"] <= 0:
+                continue
+            cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
+            centroids_this.append((cx, cy, time.time()))
+
+            # Find nearest previous centroid to estimate speed
+            speed_ok = False
+            if self._prev_centroids:
+                px, py, pt = min(self._prev_centroids, key=lambda p: (p[0]-cx)**2 + (p[1]-cy)**2)
+                # pixels per frame: we assume ~lores fps ≈ FRAMERATE in day mode
+                dist = np.hypot(cx - px, cy - py)
+                if dist >= MIN_SPEED_PX:
+                    speed_ok = True
+            else:
+                # On first frame with candidates, don't trigger yet
+                speed_ok = False
+
+            if not speed_ok:
+                continue
+            # If we made it here, this contour passed gates this frame
+            passed_any = True
+
+        # Persistence across frames: require N consecutive speed hits
+        if passed_any:
+            self._persist_hits = min(self._persist_hits + 1, PERSIST_FRAMES)
+        else:
+            self._persist_hits = 0
+
+        # Update track memory
+        self._prev_centroids = centroids_this
+
+        return self._persist_hits >= PERSIST_FRAMES
 
     def _start_recording(self):
         """Prepares filename, changes state, and starts the recording thread."""
@@ -626,36 +706,60 @@ class Camera:
 # Flask App Section
 #------------------------------------------
 
+from flask import Flask, Response, send_from_directory, redirect, url_for, request, abort, send_file
+import io, zipfile
+
 app = Flask(__name__)
 camera = Camera()
 
+def _list_recordings():
+    items = []
+    if os.path.exists(SAVE_DIR):
+        for f in os.listdir(SAVE_DIR):
+            if not f.endswith('.mp4'):
+                continue
+            fp = os.path.join(SAVE_DIR, f)
+            try:
+                st = os.stat(fp)
+            except FileNotFoundError:
+                continue
+            items.append({
+                "name": f,
+                "mtime": st.st_mtime,
+                "size": st.st_size
+            })
+    # newest first
+    items.sort(key=lambda x: x["mtime"], reverse=True)
+    return items
+
+def _safe_paths(filenames):
+    """Return list of (name, absolute_path) for valid files under SAVE_DIR."""
+    safe = []
+    base = os.path.realpath(SAVE_DIR)
+    for name in filenames:
+        if not name.endswith('.mp4'):
+            continue
+        ap = os.path.realpath(os.path.join(SAVE_DIR, name))
+        # ensure inside SAVE_DIR and exists
+        try:
+            if os.path.commonpath([ap, base]) == base and os.path.exists(ap):
+                safe.append((name, ap))
+        except Exception:
+            # commonpath can raise if mix of drives, ignore bad entries
+            continue
+    return safe
+
+def _fmt_size(bytes_):
+    for unit in ['B','KB','MB','GB','TB']:
+        if bytes_ < 1024.0:
+            return f"{bytes_:.1f} {unit}"
+        bytes_ /= 1024.0
+    return f"{bytes_:.1f} PB"
+
 @app.route('/')
 def index():
-    """Serves the main HTML page and lists recordings."""
-    recordings = []
-    if os.path.exists(SAVE_DIR):
-        all_files = [f for f in os.listdir(SAVE_DIR) if f.endswith('.mp4')]
-        try:
-            all_files.sort(key=lambda f: os.path.getmtime(os.path.join(SAVE_DIR, f)), reverse=True)
-        except FileNotFoundError:
-            print("A file was changed during list generation. Refreshing list.")
-            all_files = [f for f in os.listdir(SAVE_DIR) if f.endswith('.mp4')]
-            all_files.sort(key=lambda f: os.path.getmtime(os.path.join(SAVE_DIR, f)), reverse=True)
-        recordings = all_files
-
-    recordings_html = '<h2>No recordings yet.</h2>'
-    if recordings:
-        recordings_html = '<h2>Recordings</h2><ul id="recordings-list">'
-        for rec in recordings:
-            recordings_html += f'''
-                <li>
-                    <a href="/recordings/{rec}" target="_blank">{rec}</a>
-                    <form action="/delete/{rec}" method="POST" style="display:inline;">
-                        <button type="submit">Delete</button>
-                    </form>
-                </li>
-            '''
-        recordings_html += '</ul>'
+    """Serves the main HTML page and lists recordings with bulk actions."""
+    recordings = _list_recordings()
 
     if camera.monitoring_active:
         controls_html = f'''
@@ -672,32 +776,88 @@ def index():
             <p>Status: Monitoring is OFF.</p>
         '''
 
+    # Build recordings list with checkboxes
+    if not recordings:
+        recordings_html = '<h2>No recordings yet.</h2>'
+    else:
+        rows = []
+        for r in recordings:
+            rows.append(f'''
+                <tr>
+                    <td><input type="checkbox" name="selected" value="{r["name"]}"></td>
+                    <td><a href="/recordings/{r["name"]}" target="_blank">{r["name"]}</a></td>
+                    <td>{_fmt_size(r["size"])}</td>
+                    <td>{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["mtime"]))}</td>
+                    <td>
+                        <form action="/delete/{r["name"]}" method="POST" onsubmit="return confirm('Delete {r["name"]}?');">
+                            <button type="submit" class="mini-btn danger">Delete</button>
+                        </form>
+                    </td>
+                </tr>
+            ''')
+        rows_html = "\n".join(rows)
+        recordings_html = f'''
+            <h2>Recordings</h2>
+            <form id="bulk-form" action="/bulk" method="POST">
+                <div class="bulk-actions">
+                    <label><input type="checkbox" id="select-all"> Select All</label>
+                    <div class="spacer"></div>
+                    <button type="button" class="control-button" onclick="submitBulk('download')">Download Selected</button>
+                    <button type="button" class="control-button danger" onclick="confirmDelete()">Delete Selected</button>
+                    <input type="hidden" name="action" id="bulk-action" value="">
+                </div>
+                <div class="table-wrap">
+                    <table class="rec-table">
+                        <thead>
+                            <tr>
+                                <th></th>
+                                <th>Filename</th>
+                                <th>Size</th>
+                                <th>Modified</th>
+                                <th>Single</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {rows_html}
+                        </tbody>
+                    </table>
+                </div>
+            </form>
+        '''
+
     return f'''
     <html>
         <head>
             <title>Raspberry Pi Motion Camera</title>
             <style>
-                body {{ font-family: sans-serif; background-color: #222; color: #eee; margin: 0; padding: 0; }}
-                h1 {{ text-align: center; padding: 20px; background-color: #000; }}
+                body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background-color: #1e1e1e; color: #eee; margin: 0; }}
+                h1 {{ text-align: center; padding: 20px; background-color: #000; margin: 0; }}
                 .stream-container {{ max-width: 90%; margin: 20px auto; border: 3px solid #444; border-radius: 8px; overflow: hidden; }}
                 img {{ display: block; width: 100%; height: auto; }}
-                
+
                 .controls-container {{ text-align: center; margin: 20px; }}
                 .controls-container p {{ color: #aaa; }}
-                .control-button {{ font-size: 1.2em; padding: 10px 20px; border-radius: 8px; border: none; color: white; cursor: pointer; transition: background-color 0.2s; }}
+                .control-button {{ font-size: 1em; padding: 10px 16px; border-radius: 8px; border: none; color: #fff; cursor: pointer; background:#3a84f7; }}
                 .control-button.start {{ background-color: #28a745; }}
-                .control-button.start:hover {{ background-color: #218838; }}
                 .control-button.stop {{ background-color: #dc3545; }}
-                .control-button.stop:hover {{ background-color: #c82333; }}
+                .control-button.danger {{ background-color: #dc3545; }}
+                .control-button:disabled {{ opacity: .6; cursor: not-allowed; }}
 
-                .recordings-container {{ max-width: 90%; margin: 20px auto; padding: 10px 20px; background-color: #333; border: 1px solid #444; border-radius: 8px; }}
+                .recordings-container {{ max-width: 90%; margin: 20px auto; padding: 10px 20px; background-color: #2a2a2a; border: 1px solid #444; border-radius: 8px; }}
                 .recordings-container h2 {{ color: #eee; border-bottom: 1px solid #555; padding-bottom: 10px; }}
-                .recordings-container ul {{ list-style: none; padding: 0; }}
-                .recordings-container li {{ display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid #444; }}
-                .recordings-container li a {{ color: #3498db; text-decoration: none; font-size: 1.1em; }}
-                .recordings-container li a:hover {{ text-decoration: underline; }}
-                .recordings-container button {{ background-color: #e74c3c; color: white; border: none; padding: 5px 10px; border-radius: 5px; cursor: pointer; }}
-                .recordings-container button:hover {{ background-color: #c0392b; }}
+
+                .bulk-actions {{ display: flex; align-items: center; gap: 8px; margin: 12px 0; }}
+                .bulk-actions .spacer {{ flex: 1; }}
+                .mini-btn {{ padding: 4px 8px; border-radius: 6px; border: none; cursor: pointer; background: #555; color: #fff; }}
+                .mini-btn.danger {{ background: #b72236; }}
+
+                .table-wrap {{ overflow-x: auto; }}
+                table.rec-table {{ width: 100%; border-collapse: collapse; font-size: 0.95em; }}
+                table.rec-table th, table.rec-table td {{ border-bottom: 1px solid #3a3a3a; padding: 8px; text-align: left; }}
+                table.rec-table th {{ color: #bbb; background: #222; position: sticky; top: 0; z-index: 1; }}
+
+                a {{ color: #4aa3ff; text-decoration: none; }}
+                a:hover {{ text-decoration: underline; }}
             </style>
         </head>
         <body>
@@ -705,7 +865,7 @@ def index():
             <div class="stream-container">
                 <img src="/video_feed">
             </div>
-            
+
             <div class="controls-container">
                 {controls_html}
             </div>
@@ -713,13 +873,45 @@ def index():
             <div class="recordings-container">
                 {recordings_html}
             </div>
+
+            <script>
+                // Select All toggle
+                const selectAll = document.getElementById('select-all');
+                if (selectAll) {{
+                    selectAll.addEventListener('change', () => {{
+                        document.querySelectorAll('input[name="selected"]').forEach(cb => cb.checked = selectAll.checked);
+                    }});
+                }}
+
+                function submitBulk(action) {{
+                    const form = document.getElementById('bulk-form');
+                    const anyChecked = [...document.querySelectorAll('input[name="selected"]')].some(cb => cb.checked);
+                    if (!anyChecked) {{
+                        alert('Please select at least one video.');
+                        return;
+                    }}
+                    document.getElementById('bulk-action').value = action;
+                    form.submit();
+                }}
+
+                function confirmDelete() {{
+                    const count = [...document.querySelectorAll('input[name="selected"]:checked')].length;
+                    if (count === 0) {{
+                        alert('Please select at least one video.');
+                        return;
+                    }}
+                    if (confirm(`Delete ${{count}} selected video(s)? This cannot be undone.`)) {{
+                        submitBulk('delete');
+                    }}
+                }}
+            </script>
         </body>
     </html>
     '''
 
 def generate_frames_for_stream(cam):
     placeholder = np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
-    placeholder[:] = (68, 68, 68) # BGR
+    placeholder[:] = (68, 68, 68)  # BGR
     text = "RECORDING IN PROGRESS"
     text_size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1, 2)
     text_x = (FRAME_WIDTH - text_size[0]) // 2
@@ -739,7 +931,7 @@ def generate_frames_for_stream(cam):
         if frame_bytes:
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-        
+
         time.sleep(1 / (FRAMERATE * 2))
 
 @app.route('/video_feed')
@@ -755,7 +947,7 @@ def delete_recording(filename):
     try:
         file_path = os.path.join(SAVE_DIR, filename)
         if os.path.commonprefix((os.path.realpath(file_path), os.path.realpath(SAVE_DIR))) != os.path.realpath(SAVE_DIR):
-                return "Invalid filename.", 400
+            return "Invalid filename.", 400
 
         if os.path.exists(file_path):
             os.remove(file_path)
@@ -767,6 +959,49 @@ def delete_recording(filename):
         return "Error deleting file.", 500
 
     return redirect(url_for('index'))
+
+@app.route('/bulk', methods=['POST'])
+def bulk_action():
+    action = request.form.get('action', '').strip().lower()
+    selected = request.form.getlist('selected')
+    files = _safe_paths(selected)
+
+    if not files:
+        return redirect(url_for('index'))
+
+    if action == 'delete':
+        deleted = 0
+        for name, path in files:
+            try:
+                os.remove(path)
+                deleted += 1
+            except Exception as e:
+                print(f"Error deleting {name}: {e}")
+        print(f"Bulk delete: removed {deleted} file(s).")
+        return redirect(url_for('index'))
+
+    elif action == 'download':
+        # Create a zip in memory (good for modest selections)
+        buf = io.BytesIO()
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        zip_name = f"recordings_{ts}.zip"
+        try:
+            with zipfile.ZipFile(buf, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+                for name, path in files:
+                    # store with plain filename
+                    zf.write(path, arcname=name)
+            buf.seek(0)
+            return send_file(
+                buf,
+                mimetype='application/zip',
+                as_attachment=True,
+                download_name=zip_name
+            )
+        except Exception as e:
+            print(f"Error creating zip: {e}")
+            abort(500)
+    else:
+        return redirect(url_for('index'))
 
 @app.route('/start_monitoring', methods=['POST'])
 def start_monitoring():
@@ -783,7 +1018,7 @@ if __name__ == '__main__':
         camera.start()
         if camera.running:
             print("\n--- Starting Flask Web Server ---")
-            app.run(host='0.0.0.0', port=5000, threaded=True)
+            app.run(host='0.0.0.0', port=5000, threaded=True, use_reloader=False)
         else:
             print("\n--- Application startup failed: Could not initialize camera. ---")
     except KeyboardInterrupt:
