@@ -1,4 +1,3 @@
-
 import cv2
 import time
 import os
@@ -32,22 +31,21 @@ JPEG_QUALITY = 85
 LORES_WIDTH = 320
 LORES_HEIGHT = 240
 SAVE_DIR = 'recordings'
-MOTION_THRESHOLD = 112
-YOLO_CONFIDENCE = 0.3
+MOTION_THRESHOLD = 125
+YOLO_CONFIDENCE = 0.5
 POST_MOTION_RECORD_SECONDS = 2.0
 MIN_RECORD_TIME_SECONDS = 4.0
 PRE_RECORD_SECONDS = 2
 PRE_RECORD_FRAMES = FRAMERATE * PRE_RECORD_SECONDS
 TARGET_CLASSES_TO_IGNORE = [] #['bird', 'airplane', 'insect']
-# [FIX] Define the missing constant for how often to run YOLO on the live feed
-YOLO_FRAME_INTERVAL = 1 # Higher number is less frequent (e.g., runs on 1 out of every FRAMERATE/2 frames)
+YOLO_FRAME_INTERVAL = 1 
 YOLO_VIDEO_ANALYSIS_INTERVAL_SECONDS = 0.1
 
 # [NEW] Add new constants for night mode control
-NIGHT_MODE_GAIN_THRESHOLD = 7.0 # Switch to night mode when analog gain is above this
-DAY_MODE_GAIN_THRESHOLD = 7.0  # Switch back to day mode when it's below this
-NIGHT_EXPOSURE_SECONDS = 0.5     # 2-second exposure for astrophotography
-NIGHT_ANALOGUE_GAIN = 16.0     # Maximize sensor gain for low light
+NIGHT_MODE_GAIN_THRESHOLD = 7.0 
+DAY_MODE_GAIN_THRESHOLD = 6.0  # Lowered slightly to prevent flickering
+NIGHT_EXPOSURE_SECONDS = 1   
+NIGHT_ANALOGUE_GAIN = 16.0   
 
 class Camera:
     """
@@ -85,8 +83,8 @@ class Camera:
         self.stream_paused_event = threading.Event()
         self.latest_frame_for_stream = None
         self.latest_detections = []
-        self.monitoring_active = False # Start with monitoring OFF by default
-        self.is_night_mode = False # [NEW] Flag to track camera mode
+        self.monitoring_active = False 
+        self.is_night_mode = False 
 
         # FPS calculation
         self.last_frame_time = time.time()
@@ -94,7 +92,7 @@ class Camera:
         self.fps_lock = threading.Lock()
 
     def start(self):
-        """[MODIFIED] Initializes and starts the camera with auto-exposure controls."""
+        """Initializes and starts the camera with auto-exposure controls."""
         print("\n--- Initializing Camera System ---")
         try:
             self.picam2 = Picamera2()
@@ -111,10 +109,9 @@ class Camera:
             )
             self.picam2.configure(config)
             self.picam2.start()
-            # [NEW] Get the max exposure time supported by the sensor
             self.max_exposure_time = self.picam2.camera_controls['ExposureTime'][1]
             print(f"Sensor max exposure time: {self.max_exposure_time} microseconds")
-            time.sleep(1.0) # Allow time for camera algorithms to settle
+            time.sleep(1.0) 
             print("[SUCCESS] picamera2 started successfully with auto-exposure controls.")
         except Exception as e:
             print(f"[FAIL] Failed to initialize picamera2: {e}")
@@ -131,7 +128,6 @@ class Camera:
         """Captures hi-res frames, manages the pre-record buffer, and feeds the recording queue."""
         while self.running:
             try:
-                # [NEW] In night mode, a capture can take a long time. Timeout helps exit gracefully.
                 request = self.picam2.capture_request()
                 if request is None and self.is_night_mode:
                     time.sleep(0.1)
@@ -169,10 +165,11 @@ class Camera:
 
         while self.running:
             try:
-                # [NEW] Always check for mode switches, regardless of monitoring state
-                self._check_and_update_camera_mode()
+                # --- The fix is here: Don't change camera mode while recording ---
+                # This ensures the recording pipeline is not interrupted.
+                if self.state == State.IDLE:
+                    self._check_and_update_camera_mode()
 
-                # [NEW] If in night mode, bypass all motion detection logic
                 if self.is_night_mode:
                     time.sleep(1) # Check light levels every second
                     continue
@@ -189,13 +186,12 @@ class Camera:
                 if prev_lores_gray is None:
                     prev_lores_gray = lores_gray
                     continue
-            
+
                 frame_delta = cv2.absdiff(prev_lores_gray, lores_gray)
                 thresh = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)[1]
                 motion_detected = cv2.countNonZero(thresh) > MOTION_THRESHOLD
                 prev_lores_gray = lores_gray
 
-                # Run YOLO detection periodically on the main thread for live view
                 frame_counter += 1
                 if frame_counter % (FRAMERATE // YOLO_FRAME_INTERVAL) == 0:
                     main_frame_for_yolo = self.picam2.capture_array("main")
@@ -243,59 +239,79 @@ class Camera:
             self.recording_thread.start()
 
     def _check_and_update_camera_mode(self):
-        """ [NEW] Checks ambient light and switches between day/night modes. """
-        metadata = self.picam2.capture_metadata()
-        analogue_gain = metadata.get("AnalogueGain", 0)
-
-        #print(f"Current Analogue Gain: {analogue_gain:.2f}")
-
-        # If it's dark and we are in day mode, switch to night mode
-        if analogue_gain > NIGHT_MODE_GAIN_THRESHOLD and not self.is_night_mode:
-            self._enable_night_mode()
-        # If it's light and we are in night mode, switch back to day mode
-        elif analogue_gain < DAY_MODE_GAIN_THRESHOLD and self.is_night_mode:
-            self._enable_day_mode()
+        """ 
+        Checks ambient light and switches between day/night modes.
+        This function now contains the "peeking" logic to prevent getting stuck.
+        """
+        if self.is_night_mode:
+            # --- PEEKING LOGIC ---
+            # 1. Temporarily enable auto-exposure to check the real light level
+            self.picam2.set_controls({"AeEnable": True})
+            time.sleep(0.5) # Give sensor time to adjust
+            
+            # 2. Get the new metadata
+            metadata = self.picam2.capture_metadata()
+            analogue_gain = metadata.get("AnalogueGain", 0)
+            
+            # 3. Decide whether to switch back to day mode
+            if analogue_gain < DAY_MODE_GAIN_THRESHOLD:
+                self._enable_day_mode() # It's bright, switch to day mode
+            else:
+                # It's still dark, revert to manual night mode settings
+                self._enable_night_mode(force_revert=True)
+        else:
+            # --- STANDARD DAYTIME LOGIC ---
+            metadata = self.picam2.capture_metadata()
+            analogue_gain = metadata.get("AnalogueGain", 0)
+            if analogue_gain > NIGHT_MODE_GAIN_THRESHOLD:
+                self._enable_night_mode()
     
-    def _enable_night_mode(self):
-        """ [NEW] Sets camera controls for long-exposure night viewing. """
-        print(f"🌙 Switching to NIGHT MODE. Analog gain: {self.picam2.capture_metadata()['AnalogueGain']:.2f}")
+    def _enable_night_mode(self, force_revert=False):
+            """Sets camera controls for long-exposure night viewing."""
+            if not force_revert: # Only print the full message on the initial switch
+                print(f"🌙 Switching to NIGHT MODE. Analog gain: {self.picam2.capture_metadata()['AnalogueGain']:.2f}")
+                if self.monitoring_active:
+                    print(" Motion monitoring for night mode.")
+                    #self.stop_monitoring()
 
-        if self.monitoring_active:
-            print("   -> Disabling motion monitoring for night mode.")
-            self.stop_monitoring()
+            exposure_time_us = int(NIGHT_EXPOSURE_SECONDS * 1_000_000)
+            exposure_time_us = min(exposure_time_us, self.max_exposure_time)
 
-        exposure_time_us = int(NIGHT_EXPOSURE_SECONDS * 1_000_000)
-        exposure_time_us = min(exposure_time_us, self.max_exposure_time)
-
-        # ✅ MODIFIED HERE
-        # Calculate a compatible frame rate instead of using None
-        compatible_fps = 1 / NIGHT_EXPOSURE_SECONDS
-
-        controls_to_set = {
-            "AeEnable": False,
-            "AwbEnable": False,
-            "ExposureTime": exposure_time_us,
-            "AnalogueGain": NIGHT_ANALOGUE_GAIN,
-            "FrameRate": compatible_fps # Set a valid, non-conflicting framerate
-        }
-        self.picam2.set_controls(controls_to_set)
-        self.is_night_mode = True
-        print(f"   -> Set Exposure: {exposure_time_us/1_000_000:.2f}s, Gain: {NIGHT_ANALOGUE_GAIN}, FPS: {compatible_fps:.2f}")
+            controls_to_set = {
+                "AeEnable": False,
+                "AwbEnable": False,
+                "ExposureTime": exposure_time_us,
+                "AnalogueGain": NIGHT_ANALOGUE_GAIN,
+                "FrameRate": 1.0 # Set a very low framerate to allow for the long exposure
+            }
+            self.picam2.set_controls(controls_to_set)
+            self.is_night_mode = True
+            if not force_revert:
+                print(f"    -> Set Exposure: {exposure_time_us/1_000_000:.2f}s, Gain: {NIGHT_ANALOGUE_GAIN}")
 
 
     def _enable_day_mode(self):
-        """ [NEW] Resets camera controls for standard daytime operation. """
+        """Resets camera controls for standard daytime operation."""
         print("☀️ Switching to DAY MODE.")
         
-        # ✅ MODIFIED HERE
+        # Disable auto-exposure first to prevent a sudden jump in gain
+        self.picam2.set_controls({
+            "AeEnable": False,
+            "AwbEnable": False,
+            "FrameRate": FRAMERATE
+        })
+
+        time.sleep(1.0) # Give the sensor a moment to stabilize
+
+        # Re-enable auto-exposure with a smooth start
         controls_to_set = {
-            "AeEnable": True, 
+            "AeEnable": True,
             "AwbEnable": True,
-            "FrameRate": FRAMERATE # Restore the original frame rate
+            "FrameRate": FRAMERATE
         }
         self.picam2.set_controls(controls_to_set)
         self.is_night_mode = False
-        time.sleep(1.0) 
+        time.sleep(1.0) # Wait for auto-exposure to converge
 
     def _stop_recording(self):
         """Stops recording and triggers the asynchronous video analysis."""
@@ -339,7 +355,6 @@ class Camera:
                 frame_bgr = self.recording_queue.get(timeout=1)
                 annotated_frame_bgr = self._get_annotated_frame(frame_bgr, draw_status=False)
                 
-                # [FIX] Convert BGR to RGB for correct colors in the saved MP4 file.
                 frame_to_write_rgb = cv2.cvtColor(annotated_frame_bgr, cv2.COLOR_BGR2RGB)
                 self.video_writer.write(frame_to_write_rgb)
                 
@@ -413,7 +428,6 @@ class Camera:
                     cv2.putText(annotated_frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
         if draw_status:
-            # [MODIFIED] Add night mode status display
             if self.is_night_mode:
                 mode_text, mode_color = "MODE: NIGHT", (255, 255, 0) # Cyan for night
             else:
@@ -427,7 +441,6 @@ class Camera:
             cv2.putText(annotated_frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
 
         with self.fps_lock:
-            # [NEW] In night mode, FPS isn't meaningful, so show exposure time instead
             if self.is_night_mode:
                 info_text = f"Exposure: {NIGHT_EXPOSURE_SECONDS}s"
             else:
@@ -440,7 +453,7 @@ class Camera:
         return annotated_frame
 
     def get_jpeg_frame(self):
-        """[FIX] Encodes the latest streamable frame into a JPEG with correct color space."""
+        """Encodes the latest streamable frame into a JPEG with correct color space."""
         with self.lock:
             if self.latest_frame_for_stream is None:
                 frame_bgr = np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
@@ -448,7 +461,6 @@ class Camera:
             else:
                 frame_bgr = self.latest_frame_for_stream
         
-        # [FIX] Convert from OpenCV's BGR to standard RGB for web display.
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         
         ret, buffer = cv2.imencode('.jpg', frame_rgb, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
@@ -463,7 +475,7 @@ class Camera:
         if self.processing_thread.is_alive(): self.processing_thread.join(timeout=2)
         
         if self.state == State.RECORDING:
-             self._stop_recording()
+                self._stop_recording()
 
         if self.picam2:
             self.picam2.stop()
@@ -484,8 +496,7 @@ class Camera:
 
 
 #------------------------------------------
-# The Flask app part of the code remains the same.
-# It will automatically pick up the renamed files when the page is refreshed.
+# Flask App Section
 #------------------------------------------
 
 app = Flask(__name__)
@@ -498,10 +509,8 @@ def index():
     if os.path.exists(SAVE_DIR):
         all_files = [f for f in os.listdir(SAVE_DIR) if f.endswith('.mp4')]
         try:
-            # Sort by modification time to show newest first
             all_files.sort(key=lambda f: os.path.getmtime(os.path.join(SAVE_DIR, f)), reverse=True)
         except FileNotFoundError:
-            # This can happen if a file is deleted/renamed by the analysis thread while sorting
             print("A file was changed during list generation. Refreshing list.")
             all_files = [f for f in os.listdir(SAVE_DIR) if f.endswith('.mp4')]
             all_files.sort(key=lambda f: os.path.getmtime(os.path.join(SAVE_DIR, f)), reverse=True)
@@ -619,7 +628,7 @@ def delete_recording(filename):
     try:
         file_path = os.path.join(SAVE_DIR, filename)
         if os.path.commonprefix((os.path.realpath(file_path), os.path.realpath(SAVE_DIR))) != os.path.realpath(SAVE_DIR):
-             return "Invalid filename.", 400
+                return "Invalid filename.", 400
 
         if os.path.exists(file_path):
             os.remove(file_path)
@@ -654,5 +663,3 @@ if __name__ == '__main__':
         print("\nCaught KeyboardInterrupt, shutting down.")
     finally:
         camera.stop()
-
-

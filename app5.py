@@ -44,7 +44,7 @@ YOLO_VIDEO_ANALYSIS_INTERVAL_SECONDS = 0.1
 # [NEW] Add new constants for night mode control
 NIGHT_MODE_GAIN_THRESHOLD = 7.0 
 DAY_MODE_GAIN_THRESHOLD = 6.0  # Lowered slightly to prevent flickering
-NIGHT_EXPOSURE_SECONDS = 2   
+NIGHT_EXPOSURE_SECONDS = 1   
 NIGHT_ANALOGUE_GAIN = 16.0   
 
 class Camera:
@@ -160,17 +160,13 @@ class Camera:
 
     def _processing_loop(self):
         """Independently captures lo-res frames to detect motion, manage state, and control camera modes."""
-        prev_lores_gray = None
         frame_counter = 0
 
         while self.running:
             try:
-                # *** THE FIX IS HERE: This function now contains the corrected logic ***
-                self._check_and_update_camera_mode()
-
-                if self.is_night_mode:
-                    time.sleep(1) # Check light levels every second
-                    continue
+                # --- Day/Night Mode Control ---
+                if self.state == State.IDLE:
+                    self._check_and_update_camera_mode()
 
                 if not self.monitoring_active:
                     if self.latest_detections:
@@ -178,18 +174,14 @@ class Camera:
                     time.sleep(0.1)
                     continue
 
-                lores_frame = self.picam2.capture_array("lores")
-                lores_gray = lores_frame[0:LORES_HEIGHT, 0:LORES_WIDTH]
-                lores_gray = cv2.GaussianBlur(lores_gray, (15, 15), 0)
-                if prev_lores_gray is None:
-                    prev_lores_gray = lores_gray
-                    continue
-                
-                frame_delta = cv2.absdiff(prev_lores_gray, lores_gray)
-                thresh = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)[1]
-                motion_detected = cv2.countNonZero(thresh) > MOTION_THRESHOLD
-                prev_lores_gray = lores_gray
+                motion_detected = False
+                if self.is_night_mode:
+                    motion_detected = self._night_mode_motion_detection()
+                else:
+                    # --- NEW: Use a dedicated motion detection method for day mode ---
+                    motion_detected = self._day_mode_motion_detection()
 
+                # --- YOLO processing logic (remains the same) ---
                 frame_counter += 1
                 if frame_counter % (FRAMERATE // YOLO_FRAME_INTERVAL) == 0:
                     main_frame_for_yolo = self.picam2.capture_array("main")
@@ -197,12 +189,12 @@ class Camera:
                     with self.lock:
                         self.latest_detections = results
 
+                # --- Recording logic (remains the same) ---
                 if motion_detected:
                     self.last_motion_time = time.time()
                     if self.state == State.IDLE:
                         print("✔️ Motion detected. Starting recording.")
                         self._start_recording()
-
                 elif self.state == State.RECORDING:
                     time_since_start = time.time() - self.recording_start_time
                     time_since_last_motion = time.time() - self.last_motion_time
@@ -215,6 +207,40 @@ class Camera:
                 print(f"Error in processing loop: {e}")
                 self.running = False
         print("Processing loop has stopped.")
+
+    def _day_mode_motion_detection(self):
+        """
+        Detects motion in day mode using contour analysis to ignore large, slow-moving objects like clouds.
+        """
+        if not hasattr(self, 'prev_lores_day_gray'):
+            self.prev_lores_day_gray = self.picam2.capture_array("lores")[0:LORES_HEIGHT, 0:LORES_WIDTH]
+            self.prev_lores_day_gray = cv2.GaussianBlur(self.prev_lores_day_gray, (15, 15), 0)
+            return False
+            
+        lores_frame = self.picam2.capture_array("lores")
+        lores_gray = lores_frame[0:LORES_HEIGHT, 0:LORES_WIDTH]
+        lores_gray = cv2.GaussianBlur(lores_gray, (15, 15), 0)
+
+        frame_delta = cv2.absdiff(self.prev_lores_day_gray, lores_gray)
+        self.prev_lores_day_gray = lores_gray
+
+        thresh = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)[1]
+        
+        # Use a dilate operation to close gaps in contours
+        thresh = cv2.dilate(thresh, None, iterations=2)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        min_area = 50   # Ignore small noise
+        max_area = 12000 # Ignore large objects like clouds
+        
+        for c in contours:
+            area = cv2.contourArea(c)
+            if min_area < area < max_area:
+                # You can add more checks here, e.g., for aspect ratio or speed
+                print(f"Day motion detected with contour area: {area}")
+                return True
+        
+        return False
 
     def _start_recording(self):
         """Prepares filename, changes state, and starts the recording thread."""
@@ -265,40 +291,51 @@ class Camera:
                 self._enable_night_mode()
     
     def _enable_night_mode(self, force_revert=False):
-        """Sets camera controls for long-exposure night viewing."""
-        if not force_revert: # Only print the full message on the initial switch
-            print(f"🌙 Switching to NIGHT MODE. Analog gain: {self.picam2.capture_metadata()['AnalogueGain']:.2f}")
-            if self.monitoring_active:
-                print(" Motion monitoring for night mode.")
-                #self.stop_monitoring()
+            """Sets camera controls for long-exposure night viewing."""
+            if not force_revert: # Only print the full message on the initial switch
+                print(f"🌙 Switching to NIGHT MODE. Analog gain: {self.picam2.capture_metadata()['AnalogueGain']:.2f}")
+                if self.monitoring_active:
+                    print(" Motion monitoring for night mode.")
+                    #self.stop_monitoring()
 
-        exposure_time_us = int(NIGHT_EXPOSURE_SECONDS * 1_000_000)
-        exposure_time_us = min(exposure_time_us, self.max_exposure_time)
-        
-        controls_to_set = {
-            "AeEnable": False,
-            "AwbEnable": False,
-            "ExposureTime": exposure_time_us,
-            "AnalogueGain": NIGHT_ANALOGUE_GAIN,
-        }
-        self.picam2.set_controls(controls_to_set)
-        self.is_night_mode = True
-        if not force_revert:
-             print(f"   -> Set Exposure: {exposure_time_us/1_000_000:.2f}s, Gain: {NIGHT_ANALOGUE_GAIN}")
+            exposure_time_us = int(NIGHT_EXPOSURE_SECONDS * 1_000_000)
+            exposure_time_us = min(exposure_time_us, self.max_exposure_time)
+
+            controls_to_set = {
+                "AeEnable": False,
+                "AwbEnable": False,
+                "ExposureTime": exposure_time_us,
+                "AnalogueGain": NIGHT_ANALOGUE_GAIN,
+                "FrameRate": 1.0 # Set a very low framerate to allow for the long exposure
+            }
+            self.picam2.set_controls(controls_to_set)
+            self.is_night_mode = True
+            if not force_revert:
+                print(f"    -> Set Exposure: {exposure_time_us/1_000_000:.2f}s, Gain: {NIGHT_ANALOGUE_GAIN}")
 
 
     def _enable_day_mode(self):
         """Resets camera controls for standard daytime operation."""
         print("☀️ Switching to DAY MODE.")
         
+        # Disable auto-exposure first to prevent a sudden jump in gain
+        self.picam2.set_controls({
+            "AeEnable": False,
+            "AwbEnable": False,
+            "FrameRate": FRAMERATE
+        })
+
+        time.sleep(1.0) # Give the sensor a moment to stabilize
+
+        # Re-enable auto-exposure with a smooth start
         controls_to_set = {
-            "AeEnable": True, 
+            "AeEnable": True,
             "AwbEnable": True,
             "FrameRate": FRAMERATE
         }
         self.picam2.set_controls(controls_to_set)
         self.is_night_mode = False
-        time.sleep(1.0) 
+        time.sleep(1.0) # Wait for auto-exposure to converge
 
     def _stop_recording(self):
         """Stops recording and triggers the asynchronous video analysis."""
@@ -325,6 +362,39 @@ class Camera:
         
         self.stream_paused_event.clear()
         self.current_recording_path = None
+
+    def _night_mode_motion_detection(self):
+        """
+        Detects motion in night mode by looking for changes in a specific frame of the lo-res stream.
+        This is a different approach from the day mode's pixel count to accommodate the long exposures.
+        """
+        try:
+            # Capture a lo-res frame which is not affected by the long exposure of the main stream
+            lores_frame = self.picam2.capture_array("lores")
+            lores_gray = lores_frame[0:LORES_HEIGHT, 0:LORES_WIDTH]
+            lores_gray = cv2.GaussianBlur(lores_gray, (15, 15), 0)
+
+            if not hasattr(self, 'prev_lores_night_gray'):
+                self.prev_lores_night_gray = lores_gray
+                return False
+
+            frame_delta = cv2.absdiff(self.prev_lores_night_gray, lores_gray)
+            self.prev_lores_night_gray = lores_gray
+
+            thresh = cv2.threshold(frame_delta, 50, 255, cv2.THRESH_BINARY)[1]
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            min_area = 50  # Adjust this value based on testing
+            for c in contours:
+                if cv2.contourArea(c) > min_area:
+                    print("Night motion detected!")
+                    return True
+            
+            return False
+
+        except Exception as e:
+            print(f"Error in night mode motion detection: {e}")
+            return False
 
     def _recording_loop(self):
         """Writes frames from the queue to the video file, with correct color space."""
