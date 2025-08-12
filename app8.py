@@ -46,21 +46,23 @@ NIGHT_MODE_GAIN_THRESHOLD = 7.0
 DAY_MODE_GAIN_THRESHOLD = 6.0  # Lowered slightly to prevent flickering
 NIGHT_EXPOSURE_SECONDS = 1
 NIGHT_ANALOGUE_GAIN = 14.0
+KNOWN_AERIAL_OBJECTS = {'bird', 'airplane', 'helicopter', 'drone'}
+BENIGN_CLASSES = ['cloud', 'sky', 'sun', 'moon', 'smoke', 'fog']
 
 # --- Day/Sky motion detection tuning ---
 MOG_HISTORY = 300            # frames remembered by background model
-MOG_VAR_THRESH = 12          # sensitivity to foreground (lower = more sensitive)
+MOG_VAR_THRESH = 15          # sensitivity to foreground (lower = more sensitive)
 MOG_LEARN_RATE = 0.0025       # how fast background adapts (0.001–0.01)
 EDGE_THRESH = 18             # Laplacian edge threshold (15–25)
 EDGE_DENSITY_MIN = 0.2      # min fraction of edge pixels inside a blob (rejects cloud mush)
-DAY_AREA_MIN = 5           # min blob area in lores pixels (ignore specks)
+DAY_AREA_MIN = 10           # (INCREASED) min blob area in lores pixels (ignore specks)
 DAY_AREA_MAX = 3000          # max blob area (reject huge cloud chunks)
 GLOBAL_CHANGE_REJECT = 0.02  # if >8% of frame changes, treat as weather (ignore)
 
 # NEW: speed & persistence gates
 MIN_SPEED_PX = 2           # min centroid speed (pixels/frame at lores)
-PERSIST_FRAMES = 2           # require this many consecutive speed hits
-MIN_LOCAL_CONTRAST = 10.0    # reject very flat/washed-out cloud blobs
+PERSIST_FRAMES = 3           # (INCREASED) require this many consecutive speed hits
+MIN_LOCAL_CONTRAST = 40.0    # (INCREASED) reject very flat/washed-out cloud blobs
 
 class Camera:
     """
@@ -249,7 +251,6 @@ class Camera:
                 if self.is_night_mode:
                     motion_detected = self._night_mode_motion_detection()
                 else:
-                    # --- NEW: Use a dedicated motion detection method for day mode ---
                     motion_detected = self._day_mode_motion_detection()
 
                 # --- YOLO processing logic (remains the same) ---
@@ -374,101 +375,98 @@ class Camera:
 
     def _day_mode_motion_detection(self):
         """
-        Sky-only detector that rejects clouds by combining:
-          - MOG2 background (absorbs slow/broad cloud drift)
-          - Edge-density + local contrast (birds/planes are 'edgy' & higher contrast)
-          - Global-change reject (weather sweeps)
-          - Speed + short persistence (cloud fragments move too slowly)
-          - (Optional) YOLO confirm on the ROI
+        Improved motion detection for UAPs:
+        - Uses background subtraction to find blobs.
+        - Rejects large, sweeping changes that are likely weather.
+        - Uses a series of filters (area, aspect ratio, and local contrast) to
+          distinguish genuine motion from benign phenomena like clouds.
+        - The `_analyze_and_rename_video` method, which is run after a video is
+          recorded, is responsible for using YOLO to tag the video, not this method.
         """
-        # Get the latest lo-res gray frame
         with self.lock:
             lo = None if self.latest_lores_gray is None else self.latest_lores_gray.copy()
-            full_for_yolo = None if self.latest_frame_for_stream is None else self.latest_frame_for_stream.copy()
-        if lo is None:
+            hires_frame = None if self.latest_frame_for_stream is None else self.latest_frame_for_stream.copy()
+
+        if lo is None or hires_frame is None:
+            self._persist_hits = 0
             return False
 
         h, w = lo.shape[:2]
 
-        # Pre-smooth to reduce cloud texture
         lo_blur = cv2.GaussianBlur(lo, (7, 7), 0)
 
-        # --- Foreground via MOG2 dynamic background
-        fg = self.bg_day.apply(lo_blur, learningRate=MOG_LEARN_RATE)
-        fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
-        fg = cv2.dilate(fg, None, iterations=1)
+        fg_mask = self.bg_day.apply(lo_blur, learningRate=MOG_LEARN_RATE)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+        fg_mask = cv2.dilate(fg_mask, None, iterations=1)
 
-        # Reject sweeping global change (weather)
-        if cv2.countNonZero(fg) > int(GLOBAL_CHANGE_REJECT * w * h):
+        # Reject sweeping global changes (weather)
+        non_zero_pixels = cv2.countNonZero(fg_mask)
+        if non_zero_pixels > int(GLOBAL_CHANGE_REJECT * w * h):
+            print(f"Rejecting frame due to global change ({non_zero_pixels} pixels > {int(GLOBAL_CHANGE_REJECT * w * h * 100)}%)")
             self._persist_hits = 0
-            self._prev_centroids = []
             return False
 
-        # --- Edge mask (compact aerial targets are edge-dense)
-        lap = cv2.Laplacian(lo_blur, cv2.CV_16S, ksize=3)
-        lap = cv2.convertScaleAbs(lap)
-        _, edges = cv2.threshold(lap, EDGE_THRESH, 255, cv2.THRESH_BINARY)
-
-        # Candidate = foreground ∩ edges
-        candidate = cv2.bitwise_and(fg, edges)
-
-        contours, _ = cv2.findContours(candidate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        passed_any = False
-        centroids_this = []
-
+        contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Check if any blob passes the filtering. If not, reset persistence.
+        motion_found = False
         for c in contours:
             area = cv2.contourArea(c)
-            if area < DAY_AREA_MIN or area > DAY_AREA_MAX:
+            x, y, w_bbox, h_bbox = cv2.boundingRect(c)
+            
+            # Filter 1: Check blob area
+            if area < DAY_AREA_MIN:
+                print(f"Rejecting blob due to small size: {area:.1f} (Threshold: {DAY_AREA_MIN})")
+                continue
+            if area > DAY_AREA_MAX:
+                print(f"Rejecting blob due to large size: {area:.1f} (Threshold: {DAY_AREA_MAX})")
                 continue
 
-            # Edge density inside blob (kills soft cloud tufts)
-            mask = np.zeros((h, w), dtype=np.uint8)
-            cv2.drawContours(mask, [c], -1, 255, thickness=cv2.FILLED)
-            edge_pixels = cv2.countNonZero(cv2.bitwise_and(edges, mask))
-            edge_density = edge_pixels / float(area + 1e-6)
-            if edge_density < EDGE_DENSITY_MIN:
-                continue
+            # Filter 2: Check aspect ratio (to ignore long, thin artifacts)
+            if w_bbox > 0 and h_bbox > 0:
+                aspect_ratio = float(w_bbox) / h_bbox
+                if not (0.2 < aspect_ratio < 5.0):
+                    print(f"Rejecting blob due to aspect ratio: {aspect_ratio:.2f}")
+                    continue
 
-            # Local contrast inside blob (flat clouds -> low stddev)
-            blob_pixels = cv2.bitwise_and(lo_blur, lo_blur, mask=mask)
-            mean, stddev = cv2.meanStdDev(blob_pixels, mask=mask)
-            if float(stddev[0]) < MIN_LOCAL_CONTRAST:
-                continue
+            # Filter 3: Check local contrast (to ignore washed-out cloud blobs)
+            x_hires = int(x * (FRAME_WIDTH / LORES_WIDTH))
+            y_hires = int(y * (FRAME_HEIGHT / LORES_HEIGHT))
+            w_hires = int(w_bbox * (FRAME_WIDTH / LORES_WIDTH))
+            h_hires = int(h_bbox * (FRAME_HEIGHT / LORES_HEIGHT))
+            
+            # Ensure bounding box is within frame boundaries
+            x_hires = max(0, x_hires)
+            y_hires = max(0, y_hires)
+            x2_hires = min(FRAME_WIDTH, x_hires + w_hires)
+            y2_hires = min(FRAME_HEIGHT, y_hires + h_hires)
+            
+            if x2_hires > x_hires and y2_hires > y_hires:
+                blob_hires = hires_frame[y_hires:y2_hires, x_hires:x2_hires]
+                gray_blob = cv2.cvtColor(blob_hires, cv2.COLOR_BGR2GRAY)
+                
+                # Use Laplacian to check for sharp edges
+                if gray_blob.size > 0:
+                    laplacian_var = cv2.Laplacian(gray_blob, cv2.CV_64F).var()
+                    if laplacian_var < MIN_LOCAL_CONTRAST:
+                        print(f"Rejecting blob due to low local contrast: {laplacian_var:.2f} (Threshold: {MIN_LOCAL_CONTRAST})")
+                        continue
 
-            # Centroid for speed gate
-            M = cv2.moments(c)
-            if M["m00"] <= 0:
-                continue
-            cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
-            centroids_this.append((cx, cy, time.time()))
-
-            # Find nearest previous centroid to estimate speed
-            speed_ok = False
-            if self._prev_centroids:
-                px, py, pt = min(self._prev_centroids, key=lambda p: (p[0]-cx)**2 + (p[1]-cy)**2)
-                # pixels per frame: we assume ~lores fps ≈ FRAMERATE in day mode
-                dist = np.hypot(cx - px, cy - py)
-                if dist >= MIN_SPEED_PX:
-                    speed_ok = True
+            # If a blob passes all sanity checks, we consider motion found for this frame
+            motion_found = True
+            break
+        
+        if motion_found:
+            self._persist_hits += 1
+            if self._persist_hits >= PERSIST_FRAMES:
+                print(f"Motion detected, passed all sanity and persistence checks. Triggering recording. Blob area: {area:.1f}")
+                return True
             else:
-                # On first frame with candidates, don't trigger yet
-                speed_ok = False
-
-            if not speed_ok:
-                continue
-            # If we made it here, this contour passed gates this frame
-            passed_any = True
-
-        # Persistence across frames: require N consecutive speed hits
-        if passed_any:
-            self._persist_hits = min(self._persist_hits + 1, PERSIST_FRAMES)
+                print(f"Motion detected, but still needs {PERSIST_FRAMES - self._persist_hits} more frames for persistence.")
+                return False
         else:
             self._persist_hits = 0
-
-        # Update track memory
-        self._prev_centroids = centroids_this
-
-        return self._persist_hits >= PERSIST_FRAMES
+            return False
 
     def _start_recording(self):
         """Prepares filename, changes state, and starts the recording thread."""
@@ -581,6 +579,8 @@ class Camera:
 
         print(f"[Analysis] Starting analysis for {os.path.basename(video_path)}...")
         detected_objects = set()
+        has_unidentified = False
+
         try:
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
@@ -602,8 +602,15 @@ class Camera:
                     for r in results:
                         for box in r.boxes:
                             class_name = self.model.names[int(box.cls)]
-                            if class_name not in TARGET_CLASSES_TO_IGNORE:
+                            
+                            # Check if the detected object is a known aerial object
+                            if class_name in KNOWN_AERIAL_OBJECTS:
                                 detected_objects.add(class_name)
+                            # If it's not a known aerial object and not in the ignore list,
+                            # consider it a potential UAP
+                            elif class_name not in TARGET_CLASSES_TO_IGNORE:
+                                detected_objects.add('UAP_candidate')
+                                has_unidentified = True
                 frame_number += 1
             
             cap.release()
@@ -611,7 +618,12 @@ class Camera:
             if detected_objects:
                 tags = "_".join(sorted(list(detected_objects)))
                 path_without_ext, ext = os.path.splitext(video_path)
-                new_path = f"{path_without_ext}_{tags}{ext}"
+                
+                # If a UAP candidate was found, prepend a UAP tag to the filename
+                if has_unidentified:
+                    new_path = os.path.join(SAVE_DIR, f"UAP_CANDIDATE_{os.path.basename(path_without_ext)}{ext}")
+                else:
+                    new_path = f"{path_without_ext}_{tags}{ext}"
                 
                 os.rename(video_path, new_path)
                 print(f"[Analysis] Success! Renamed video to: {os.path.basename(new_path)}")
