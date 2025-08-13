@@ -419,40 +419,47 @@ class Camera:
         time.sleep(0.7)  # let AE converge
 
     def _day_mode_motion_detection(self):
-        """
-        Detects motion in day mode using contour analysis to ignore large, slow-moving objects like clouds.
-        """
-        with self.lock:
-            lores_gray = None if self.latest_lores_gray is None else self.latest_lores_gray.copy()
-        if lores_gray is None:
+            """
+            Detects motion in day mode using contour analysis with temporal consistency to ignore slow-moving clouds.
+            """
+            with self.lock:
+                lores_gray = None if self.latest_lores_gray is None else self.latest_lores_gray.copy()
+            if lores_gray is None:
+                return False
+            if not hasattr(self, 'prev_lores_day_gray'):
+                self.prev_lores_day_gray = cv2.GaussianBlur(lores_gray, (21, 21), 0)
+                self.motion_history = collections.deque(maxlen=3)  # Track last 3 frames for consistency
+                return False
+
+            lores_gray = cv2.GaussianBlur(lores_gray, (21, 21), 0)
+            frame_delta = cv2.absdiff(self.prev_lores_day_gray, lores_gray)
+            self.prev_lores_day_gray = lores_gray
+            thresh = cv2.threshold(frame_delta, 40, 255, cv2.THRESH_BINARY)[1]
+            thresh = cv2.dilate(thresh, None, iterations=2)
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            min_area = 5
+            max_area = 3000
+
+            motion_detected = False
+            detected_area = None  # Store area of valid contour
+            for c in contours:
+                area = cv2.contourArea(c)
+                if min_area < area < max_area:
+                    motion_detected = True
+                    detected_area = area  # Save area for printing
+                    break
+
+            # Append motion detection result to history
+            self.motion_history.append(motion_detected)
+        
+            # Require motion in at least 2 out of 3 consecutive frames
+            if len(self.motion_history) == self.motion_history.maxlen:
+                consecutive_motion = sum(self.motion_history) >= 2
+                if consecutive_motion and detected_area is not None:
+                    print(f"Day motion detected with contour area: {detected_area}")
+                    return True
+
             return False
-
-        if not hasattr(self, 'prev_lores_day_gray'):
-            self.prev_lores_day_gray = cv2.GaussianBlur(lores_gray, (15, 15), 0)
-            return False
-
-        lores_gray = cv2.GaussianBlur(lores_gray, (15, 15), 0) #--------
-
-        frame_delta = cv2.absdiff(self.prev_lores_day_gray, lores_gray)
-        self.prev_lores_day_gray = lores_gray
-
-        thresh = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)[1]
-        
-        # Use a dilate operation to close gaps in contours
-        thresh = cv2.dilate(thresh, None, iterations=2)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        min_area = 5   # Ignore small noise
-        max_area = 3000 # Ignore large objects like clouds
-        
-        for c in contours:
-            area = cv2.contourArea(c)
-            if min_area < area < max_area:
-                # You can add more checks here, e.g., for aspect ratio or speed
-                print(f"Day motion detected with contour area: {area}")
-                return True
-        
-        return False
 
     def _start_recording(self):
         """Prepares filename, changes state, and starts the recording thread."""
