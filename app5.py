@@ -5,7 +5,7 @@ import threading
 import collections
 import queue
 import numpy as np
-from flask import Flask, Response, send_from_directory, redirect, url_for
+from flask import Flask, Response, send_from_directory, redirect, url_for,request, abort, send_file, flash, get_flashed_messages
 from ultralytics import YOLO
 
 import sys
@@ -461,26 +461,49 @@ class Camera:
 
             return False
 
-    def _start_recording(self):
-        """Prepares filename, changes state, and starts the recording thread."""
-        with self.lock:
-            if self.state == State.RECORDING: return
-            
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            self.current_recording_path = os.path.join(SAVE_DIR, f"motion_{timestamp}.mp4")
 
-            self.recording_start_time = time.time()
-            self.last_motion_time = time.time()
-            self.state = State.RECORDING
-            self.stream_paused_event.set()
+    def _stop_recording(self):
+            """
+            Stops recording, ensures VideoWriter is released, and triggers video analysis.
+            """
+            path_to_analyze = None
+            with self.lock:
+                if self.state == State.IDLE:
+                    return
+                print("Stopping recording and finalizing video file...")
+                self.state = State.IDLE
+                path_to_analyze = self.current_recording_path
+                self.current_recording_path = None  # Clear path immediately
 
-            print(f"Dumping {len(self.pre_record_buffer)} pre-record frames into queue...")
-            for frame in list(self.pre_record_buffer):
-                self.recording_queue.put(frame)
-            
-            self.recording_thread = threading.Thread(target=self._recording_loop, daemon=True)
-            self.recording_thread.start()
+            # Ensure VideoWriter is released
+            if self.video_writer:
+                self.video_writer.release()
+                self.video_writer = None
+                print("VideoWriter released.")
 
+            if self.recording_thread and self.recording_thread.is_alive():
+                print("Waiting for recording thread to finish writing frames...")
+                self.recording_thread.join(timeout=5.0)  # Add timeout to prevent hanging
+                if self.recording_thread.is_alive():
+                    print("Warning: Recording thread did not terminate within timeout.")
+                else:
+                    print("Recording thread finished.")
+
+            if path_to_analyze:
+                print(f"Queueing video for analysis: {os.path.basename(path_to_analyze)}")
+                analysis_thread = threading.Thread(
+                    target=self._analyze_and_rename_video,
+                    args=(path_to_analyze,),
+                    daemon=True
+                )
+                analysis_thread.start()
+                analysis_thread.join(timeout=10.0)  # Wait for analysis to complete
+                if analysis_thread.is_alive():
+                    print("Warning: Analysis thread did not complete within timeout.")
+                else:
+                    print("Video analysis completed.")
+
+            self.stream_paused_event.clear()
     
     def _stop_recording(self):
         """Stops recording and triggers the asynchronous video analysis."""
@@ -752,7 +775,6 @@ def _fmt_size(bytes_):
 def index():
     """Serves the main HTML page and lists recordings with bulk actions."""
     recordings = _list_recordings()
-
     if camera.monitoring_active:
         controls_html = f'''
             <form action="/stop_monitoring" method="POST">
@@ -767,13 +789,23 @@ def index():
             </form>
             <p>Status: Monitoring is OFF.</p>
         '''
-
+    # Build flash messages HTML
+    flash_messages = ''
+    messages = get_flashed_messages(with_categories=True)
+    if messages:
+        flash_messages = '<div class="flash-messages">'
+        for category, message in messages:
+            flash_messages += f'<p class="flash {category}">{message}</p>'
+        flash_messages += '</div>'
+    
     # Build recordings list with checkboxes
     if not recordings:
         recordings_html = '<h2>No recordings yet.</h2>'
     else:
         rows = []
         for r in recordings:
+            # Use url_for to ensure proper URL encoding
+            delete_url = url_for('delete_recording', filename=r["name"])
             rows.append(f'''
                 <tr>
                     <td><input type="checkbox" name="selected" value="{r["name"]}"></td>
@@ -781,7 +813,7 @@ def index():
                     <td>{_fmt_size(r["size"])}</td>
                     <td>{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["mtime"]))}</td>
                     <td>
-                        <form action="/delete/{r["name"]}" method="POST" onsubmit="return confirm('Delete {r["name"]}?');">
+                        <form action="{delete_url}" method="POST" onsubmit="return confirm('Delete {r["name"]}?');">
                             <button type="submit" class="mini-btn danger">Delete</button>
                         </form>
                     </td>
@@ -816,7 +848,6 @@ def index():
                 </div>
             </form>
         '''
-
     return f'''
     <html>
         <head>
@@ -826,7 +857,6 @@ def index():
                 h1 {{ text-align: center; padding: 20px; background-color: #000; margin: 0; }}
                 .stream-container {{ max-width: 90%; margin: 20px auto; border: 3px solid #444; border-radius: 8px; overflow: hidden; }}
                 img {{ display: block; width: 100%; height: auto; }}
-
                 .controls-container {{ text-align: center; margin: 20px; }}
                 .controls-container p {{ color: #aaa; }}
                 .control-button {{ font-size: 1em; padding: 10px 16px; border-radius: 8px; border: none; color: #fff; cursor: pointer; background:#3a84f7; }}
@@ -834,22 +864,22 @@ def index():
                 .control-button.stop {{ background-color: #dc3545; }}
                 .control-button.danger {{ background-color: #dc3545; }}
                 .control-button:disabled {{ opacity: .6; cursor: not-allowed; }}
-
                 .recordings-container {{ max-width: 90%; margin: 20px auto; padding: 10px 20px; background-color: #2a2a2a; border: 1px solid #444; border-radius: 8px; }}
                 .recordings-container h2 {{ color: #eee; border-bottom: 1px solid #555; padding-bottom: 10px; }}
-
                 .bulk-actions {{ display: flex; align-items: center; gap: 8px; margin: 12px 0; }}
                 .bulk-actions .spacer {{ flex: 1; }}
                 .mini-btn {{ padding: 4px 8px; border-radius: 6px; border: none; cursor: pointer; background: #555; color: #fff; }}
                 .mini-btn.danger {{ background: #b72236; }}
-
                 .table-wrap {{ overflow-x: auto; }}
                 table.rec-table {{ width: 100%; border-collapse: collapse; font-size: 0.95em; }}
                 table.rec-table th, table.rec-table td {{ border-bottom: 1px solid #3a3a3a; padding: 8px; text-align: left; }}
                 table.rec-table th {{ color: #bbb; background: #222; position: sticky; top: 0; z-index: 1; }}
-
                 a {{ color: #4aa3ff; text-decoration: none; }}
                 a:hover {{ text-decoration: underline; }}
+                .flash-messages {{ margin: 10px 0; }}
+                .flash {{ padding: 10px; border-radius: 4px; margin: 5px 0; }}
+                .flash.success {{ background-color: #28a745; color: #fff; }}
+                .flash.error {{ background-color: #dc3545; color: #fff; }}
             </style>
         </head>
         <body>
@@ -857,15 +887,13 @@ def index():
             <div class="stream-container">
                 <img src="/video_feed">
             </div>
-
             <div class="controls-container">
                 {controls_html}
             </div>
-
             <div class="recordings-container">
+                {flash_messages}
                 {recordings_html}
             </div>
-
             <script>
                 // Select All toggle
                 const selectAll = document.getElementById('select-all');
@@ -874,7 +902,6 @@ def index():
                         document.querySelectorAll('input[name="selected"]').forEach(cb => cb.checked = selectAll.checked);
                     }});
                 }}
-
                 function submitBulk(action) {{
                     const form = document.getElementById('bulk-form');
                     const anyChecked = [...document.querySelectorAll('input[name="selected"]')].some(cb => cb.checked);
@@ -885,7 +912,6 @@ def index():
                     document.getElementById('bulk-action').value = action;
                     form.submit();
                 }}
-
                 function confirmDelete() {{
                     const count = [...document.querySelectorAll('input[name="selected"]:checked')].length;
                     if (count === 0) {{
@@ -936,20 +962,40 @@ def serve_recording(filename):
 
 @app.route('/delete/<path:filename>', methods=['POST'])
 def delete_recording(filename):
+    print(f"Attempting to delete single file: {filename}")
     try:
-        file_path = os.path.join(SAVE_DIR, filename)
-        if os.path.commonprefix((os.path.realpath(file_path), os.path.realpath(SAVE_DIR))) != os.path.realpath(SAVE_DIR):
-            return "Invalid filename.", 400
-
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            print(f"Deleted recording: {filename}")
+        # Use _safe_paths for consistent path validation
+        safe_files = _safe_paths([filename])
+        if not safe_files:
+            print(f"Invalid or unsafe filename: {filename}")
+            flash(f"Invalid filename: {filename}", "error")
+            return redirect(url_for('index'))
+        name, file_path = safe_files[0]
+        if not os.path.exists(file_path):
+            print(f"File not found: {file_path}")
+            flash(f"File {name} not found.", "error")
+            return redirect(url_for('index'))
+        if not os.access(file_path, os.W_OK):
+            print(f"No write permission for file: {file_path}")
+            flash(f"Cannot delete {name}: Permission denied.", "error")
+            return redirect(url_for('index'))
+        for attempt in range(3):  # Retry up to 3 times
+            try:
+                os.remove(file_path)
+                print(f"Deleted recording: {name} on attempt {attempt + 1}")
+                flash(f"Successfully deleted {name}.", "success")
+                break
+            except OSError as e:
+                if e.errno != 13:  # Not a permission error
+                    raise
+                print(f"Retry {attempt + 1}/3: Cannot delete {name}: {e}")
+                time.sleep(1.0)  # Wait 1s before retry
         else:
-            print(f"Attempted to delete non-existent file: {filename}")
+            print(f"Failed to delete {name} after 3 retries")
+            flash(f"Cannot delete {name}: File may be in use.", "error")
     except Exception as e:
         print(f"Error deleting file {filename}: {e}")
-        return "Error deleting file.", 500
-
+        flash(f"Error deleting {filename}: {str(e)}", "error")
     return redirect(url_for('index'))
 
 @app.route('/bulk', methods=['POST'])
