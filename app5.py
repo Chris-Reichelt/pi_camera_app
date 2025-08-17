@@ -5,6 +5,7 @@ import threading
 import collections
 import queue
 import numpy as np
+import io, zipfile
 from flask import Flask, Response, send_from_directory, redirect, url_for,request, abort, send_file, flash, get_flashed_messages
 from ultralytics import YOLO
 
@@ -32,9 +33,9 @@ class State(Enum):
 
 
 # --- Constants ---
-FRAMERATE = 60
-FRAME_WIDTH = 1920
-FRAME_HEIGHT = 1080
+FRAMERATE = 30
+FRAME_WIDTH = 1600
+FRAME_HEIGHT = 900
 JPEG_QUALITY = 95
 LORES_WIDTH = 640
 LORES_HEIGHT = 480
@@ -60,8 +61,8 @@ LATITUDE = 35.9211     # <-- set to your camera location
 LONGITUDE = -80.5221   # <-- set to your camera location
 TIMEZONE = "America/New_York"  # or your local tz
 
-PEEK_WINDOW_MIN = 90          # allow peeks within ± this many minutes of sunrise
-PEEK_INTERVAL_NEAR = 30.0     # seconds between peeks during the window
+PEEK_WINDOW_MIN = 2          # allow peeks within ± this many minutes of sunrise
+PEEK_INTERVAL_NEAR = 600.0     # seconds between peeks during the window
 
 class Camera:
     """
@@ -75,7 +76,6 @@ class Camera:
     def __init__(self):
         self.picam2 = None
         self.model = YOLO('yolov8n.pt')
-
         self.state = State.IDLE
         self.lock = threading.Lock()
         self.running = False
@@ -247,11 +247,7 @@ class Camera:
                     self.latest_lores_gray = lores_gray.copy()
                 request.release()
                 
-                with self.lock:
-                    self.pre_record_buffer.append(main_frame)
-                    
-                    if self.state == State.RECORDING:
-                        self.recording_queue.put(main_frame)
+                # The duplicated block has been removed.
                 
                 annotated_frame = self._get_annotated_frame(main_frame, draw_status=True)
                 with self.lock:
@@ -261,7 +257,6 @@ class Camera:
                 print(f"Error in capture loop: {e}")
                 self.running = False
         print("Capture loop has stopped.")
-
 
     def _processing_loop(self):
         """Independently captures lo-res frames to detect motion, manage state, and control camera modes."""
@@ -419,117 +414,85 @@ class Camera:
         time.sleep(0.7)  # let AE converge
 
     def _day_mode_motion_detection(self):
-            """
-            Detects motion in day mode using contour analysis with temporal consistency to ignore slow-moving clouds.
-            """
-            with self.lock:
-                lores_gray = None if self.latest_lores_gray is None else self.latest_lores_gray.copy()
-            if lores_gray is None:
-                return False
-            if not hasattr(self, 'prev_lores_day_gray'):
-                self.prev_lores_day_gray = cv2.GaussianBlur(lores_gray, (21, 21), 0)
-                self.motion_history = collections.deque(maxlen=3)  # Track last 3 frames for consistency
-                return False
-
-            lores_gray = cv2.GaussianBlur(lores_gray, (21, 21), 0)
-            frame_delta = cv2.absdiff(self.prev_lores_day_gray, lores_gray)
-            self.prev_lores_day_gray = lores_gray
-            thresh = cv2.threshold(frame_delta, 40, 255, cv2.THRESH_BINARY)[1]
-            thresh = cv2.dilate(thresh, None, iterations=2)
-            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            min_area = 5
-            max_area = 3000
-
-            motion_detected = False
-            detected_area = None  # Store area of valid contour
-            for c in contours:
-                area = cv2.contourArea(c)
-                if min_area < area < max_area:
-                    motion_detected = True
-                    detected_area = area  # Save area for printing
-                    break
-
-            # Append motion detection result to history
-            self.motion_history.append(motion_detected)
-        
-            # Require motion in at least 2 out of 3 consecutive frames
-            if len(self.motion_history) == self.motion_history.maxlen:
-                consecutive_motion = sum(self.motion_history) >= 2
-                if consecutive_motion and detected_area is not None:
-                    print(f"Day motion detected with contour area: {detected_area}")
-                    return True
-
+        """
+        Detects motion in day mode using contour analysis with temporal consistency to ignore slow-moving clouds.
+        """
+        with self.lock:
+            lores_gray = None if self.latest_lores_gray is None else self.latest_lores_gray.copy()
+        if lores_gray is None:
+            return False
+        if not hasattr(self, 'prev_lores_day_gray'):
+            self.prev_lores_day_gray = cv2.GaussianBlur(lores_gray, (21, 21), 0)
+            self.motion_history = collections.deque(maxlen=3)  # Track last 3 frames for consistency
             return False
 
+        lores_gray = cv2.GaussianBlur(lores_gray, (21, 21), 0)
+        frame_delta = cv2.absdiff(self.prev_lores_day_gray, lores_gray)
+        self.prev_lores_day_gray = lores_gray
+        thresh = cv2.threshold(frame_delta, 30, 255, cv2.THRESH_BINARY)[1]
+        thresh = cv2.dilate(thresh, None, iterations=2)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        min_area = 3
+        max_area = 3000
 
-    def _stop_recording(self):
-            """
-            Stops recording, ensures VideoWriter is released, and triggers video analysis.
-            """
-            path_to_analyze = None
-            with self.lock:
-                if self.state == State.IDLE:
-                    return
-                print("Stopping recording and finalizing video file...")
-                self.state = State.IDLE
-                path_to_analyze = self.current_recording_path
-                self.current_recording_path = None  # Clear path immediately
+        motion_detected = False
+        detected_area = None  # Store area of valid contour
+        for c in contours:
+            area = cv2.contourArea(c)
+            if min_area < area < max_area:
+                motion_detected = True
+                detected_area = area  # Save area for printing
+                break
 
-            # Ensure VideoWriter is released
-            if self.video_writer:
-                self.video_writer.release()
-                self.video_writer = None
-                print("VideoWriter released.")
+        # Append motion detection result to history
+        self.motion_history.append(motion_detected)
+        
+        # Require motion in at least 2 out of 3 consecutive frames
+        if len(self.motion_history) == self.motion_history.maxlen:
+            consecutive_motion = sum(self.motion_history) >= 2
+            if consecutive_motion and detected_area is not None:
+                print(f"Day motion detected with contour area: {detected_area}")
+                return True
 
-            if self.recording_thread and self.recording_thread.is_alive():
-                print("Waiting for recording thread to finish writing frames...")
-                self.recording_thread.join(timeout=5.0)  # Add timeout to prevent hanging
-                if self.recording_thread.is_alive():
-                    print("Warning: Recording thread did not terminate within timeout.")
-                else:
-                    print("Recording thread finished.")
+        return False
 
-            if path_to_analyze:
-                print(f"Queueing video for analysis: {os.path.basename(path_to_analyze)}")
-                analysis_thread = threading.Thread(
-                    target=self._analyze_and_rename_video,
-                    args=(path_to_analyze,),
-                    daemon=True
-                )
-                analysis_thread.start()
-                analysis_thread.join(timeout=10.0)  # Wait for analysis to complete
-                if analysis_thread.is_alive():
-                    print("Warning: Analysis thread did not complete within timeout.")
-                else:
-                    print("Video analysis completed.")
-
-            self.stream_paused_event.clear()
-    
-    def _stop_recording(self):
-        """Stops recording and triggers the asynchronous video analysis."""
-        path_to_analyze = None
+    def _start_recording(self):
+        """Prepares filename, changes state, and starts the recording thread."""
         with self.lock:
-            if self.state == State.IDLE: return
+            if self.state == State.RECORDING: return
+            
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            self.current_recording_path = os.path.join(SAVE_DIR, f"motion_{timestamp}.mp4")
+            self.recording_start_time = time.time()
+            self.last_motion_time = time.time()
+            self.state = State.RECORDING
+            self.stream_paused_event.set()
+            print(f"Dumping {len(self.pre_record_buffer)} pre-record frames into queue...")
+            for frame in list(self.pre_record_buffer):
+                self.recording_queue.put(frame)
+            
+            self.recording_thread = threading.Thread(target=self._recording_loop, daemon=True)
+            self.recording_thread.start()
+
+    def _stop_recording(self):
+        """Signals the recording thread to stop and waits for it to finish."""
+        with self.lock:
+            if self.state == State.IDLE:
+                return
             print("Stopping recording and finalizing video file...")
-            self.state = State.IDLE
-            path_to_analyze = self.current_recording_path
-        
+            self.state = State.IDLE  # Signal the thread to stop its loop
+            self.current_recording_path = None
+
         if self.recording_thread and self.recording_thread.is_alive():
-            print("Waiting for recording thread to finish writing frames...")
-            self.recording_thread.join()
-            print("Recording thread finished.")
-        
-        if path_to_analyze:
-            print(f"Queueing video for analysis: {os.path.basename(path_to_analyze)}")
-            analysis_thread = threading.Thread(
-                target=self._analyze_and_rename_video,
-                args=(path_to_analyze,),
-                daemon=True
-            )
-            analysis_thread.start()
+            print("Waiting for recording thread to finish...")
+            # We wait longer here to allow the queue to drain properly.
+            self.recording_thread.join(timeout=30.0) 
+            if self.recording_thread.is_alive():
+                print("Error: Recording thread is unresponsive.")
+            else:
+                print("Recording thread finished.")
         
         self.stream_paused_event.clear()
-        self.current_recording_path = None
 
     def _night_mode_motion_detection(self):
         """
@@ -559,9 +522,8 @@ class Camera:
             
             return False
 
-
     def _recording_loop(self):
-        """Writes frames from the queue to the video file, with correct color space."""
+        """Writes frames from the queue to the video file and then triggers analysis."""
         out_path = self.current_recording_path
         if not out_path:
             print("[Error] Recording loop started without a valid output path.")
@@ -575,17 +537,29 @@ class Camera:
             try:
                 frame_bgr = self.recording_queue.get(timeout=1)
                 annotated_frame_bgr = self._get_annotated_frame(frame_bgr, draw_status=False)
-                
                 frame_to_write_rgb = cv2.cvtColor(annotated_frame_bgr, cv2.COLOR_BGR2RGB)
                 self.video_writer.write(frame_to_write_rgb)
-                
             except queue.Empty:
                 break
+            except Exception as e:
+                print(f"Error during recording write loop: {e}")
+                break
         
+        # --- This is the crucial part of the new logic ---
         if self.video_writer:
             self.video_writer.release()
-            self.video_writer = None
-        print(f"Video saved: {out_path}")
+            print(f"Video saved: {out_path}")
+            
+            # Now that the file is closed and valid, start the analysis.
+            print(f"Queueing video for analysis: {os.path.basename(out_path)}")
+            analysis_thread = threading.Thread(
+                target=self._analyze_and_rename_video,
+                args=(out_path,),
+                daemon=True
+            )
+            analysis_thread.start()
+        
+        self.video_writer = None
 
     def _analyze_and_rename_video(self, video_path):
         """Opens a completed video, runs YOLO detection, and renames the file with tags."""
@@ -716,7 +690,6 @@ class Camera:
             self._stop_recording()
 
 
-
 #------------------------------------------
 # Flask App Section
 #------------------------------------------
@@ -725,6 +698,7 @@ from flask import Flask, Response, send_from_directory, redirect, url_for, reque
 import io, zipfile
 
 app = Flask(__name__)
+app.secret_key = os.urandom(24)
 camera = Camera()
 
 def _list_recordings():
