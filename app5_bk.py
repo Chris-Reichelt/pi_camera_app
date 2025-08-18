@@ -49,7 +49,6 @@ PRE_RECORD_FRAMES = FRAMERATE * PRE_RECORD_SECONDS
 TARGET_CLASSES_TO_IGNORE = [] #['bird', 'airplane', 'insect']
 YOLO_FRAME_INTERVAL = 1 
 YOLO_VIDEO_ANALYSIS_INTERVAL_SECONDS = 0.1
-SUN_TRANSITION_MINUTES = 130
 
 # Add new constants for night mode control
 NIGHT_MODE_GAIN_THRESHOLD = 7.0 
@@ -62,8 +61,8 @@ LATITUDE = 35.9211     # <-- set to your camera location
 LONGITUDE = -80.5221   # <-- set to your camera location
 TIMEZONE = "America/New_York"  # or your local tz
 
-#PEEK_WINDOW_MIN = 2          # allow peeks within ± this many minutes of sunrise
-#PEEK_INTERVAL_NEAR = 600.0     # seconds between peeks during the window
+PEEK_WINDOW_MIN = 2          # allow peeks within ± this many minutes of sunrise
+PEEK_INTERVAL_NEAR = 600.0     # seconds between peeks during the window
 
 class Camera:
     """
@@ -97,11 +96,6 @@ class Camera:
         self.current_recording_path = None
         self._last_peek_ts = 0
         self._last_mode_switch_ts = 0.0
-        self.night_track_history = collections.deque(maxlen=5) 
-        self.prev_lores_day_gray = None
-        self.prev_lores_night_gray = None
-        self.motion_history = collections.deque(maxlen=3)
-        self.roi_mask = None # 
 
         # Stream Management
         self.stream_paused_event = threading.Event()
@@ -143,7 +137,7 @@ class Camera:
             self.max_exposure_time = self.picam2.camera_controls['ExposureTime'][1]
             print(f"Sensor max exposure time: {self.max_exposure_time} microseconds")
             time.sleep(1.0) 
-            self._decide_initial_mode_by_time()
+            self._decide_initial_mode_simple()  
             print("[SUCCESS] picamera2 started successfully with auto-exposure controls.")
         except Exception as e:
             print(f"[FAIL] Failed to initialize picamera2: {e}")
@@ -176,30 +170,56 @@ class Camera:
         tomorrow = datetime.now(tz).date() + timedelta(days=1)
         self._sun_refresh_after = datetime.combine(tomorrow, datetime.min.time(), tz) + timedelta(minutes=1)
 
-    def _decide_initial_mode_by_time(self):
-        """One-shot day/night classification at startup using sunrise/sunset times."""
+    def _within_sunrise_window(self):
+        """Return True iff we're within ±PEEK_WINDOW_MIN around sunrise; refresh times at midnight."""
+        tz = ZoneInfo(TIMEZONE)
+        now = datetime.now(tz)
+        if (self._sunrise_today is None) or (self._sun_refresh_after and now >= self._sun_refresh_after):
+            self._refresh_sun_times()
+        start = self._sunrise_today - timedelta(minutes=PEEK_WINDOW_MIN)
+        end   = self._sunrise_today + timedelta(minutes=PEEK_WINDOW_MIN)
+        return start <= now <= end
+
+    def _decide_initial_mode_simple(self):
+        """
+        One-shot day/night classification at startup using AE metadata.
+        Rule: if gain is high OR exposure is near the frame period => night.
+        """
         try:
-            # Ensure sun times are calculated first
-            if not self._sunrise_today:
-                self._refresh_sun_times()
+            # Ensure AE is on so metadata reflects ambient light
+            self.picam2.set_controls({"AeEnable": True, "AwbEnable": True, "FrameRate": FRAMERATE})
+            time.sleep(0.5)  # brief settle
 
-            tz = ZoneInfo(TIMEZONE)
-            now = datetime.now(tz)
-            
-            day_starts = self._sunrise_today - timedelta(minutes=SUN_TRANSITION_MINUTES)
-            night_starts = self._sunset_today + timedelta(minutes=SUN_TRANSITION_MINUTES)
+            md = self.picam2.capture_metadata()
+            gain = float(md.get("AnalogueGain", 0.0))
+            exp_us = int(md.get("ExposureTime", 0))  # microseconds
+            frame_period_us = int(1e6 / FRAMERATE)
 
-            if day_starts <= now < night_starts:
-                print(f"[InitMode] It's daytime ({now.strftime('%H:%M')}). Starting in DAY mode.")
-                self._enable_day_mode()
-            else:
-                print(f"[InitMode] It's nighttime ({now.strftime('%H:%M')}). Starting in NIGHT mode.")
+            if (gain >= NIGHT_MODE_GAIN_THRESHOLD) or (exp_us >= int(frame_period_us * 0.9)):
                 self._enable_night_mode()
-            
+            else:
+                self._enable_day_mode()
+
+            print(f"[InitMode] gain={gain:.2f}, exp={exp_us}us, frame_period={frame_period_us}us, night={self.is_night_mode}")
             self._last_mode_switch_ts = time.time()
         except Exception as e:
-            print(f"[InitMode] Fallback to DAY mode due to error: {e}")
+            print(f"[InitMode] fallback due to error: {e}")
             self._enable_day_mode()
+            self._last_mode_switch_ts = time.time()
+
+    def _estimate_scene_luma(self):
+        """
+        Fast brightness estimate from the latest stream frame.
+        Returns 0..255 or None if no frame yet.
+        """
+        with self.lock:
+            f = None if self.latest_frame_for_stream is None else self.latest_frame_for_stream.copy()
+        if f is None:
+            return None
+        #downsample + grayscale for speed
+        small = cv2.resize(f, (160, 90), interpolation=cv2.INTER_AREA)
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        return float(np.mean(gray))
 
     def _capture_loop(self):
         """Captures hi-res frames, manages the pre-record buffer, and feeds the recording queue."""
@@ -246,7 +266,7 @@ class Camera:
             try:
                 # --- Day/Night Mode Control ---
                 if self.state == State.IDLE:
-                    self._update_mode_by_time()
+                    self._check_and_update_camera_mode()
 
                 if not self.monitoring_active:
                     if self.latest_detections:
@@ -256,9 +276,9 @@ class Camera:
 
                 motion_detected = False
                 if self.is_night_mode:
-                    motion_detected = self._night_mode_airplane_detection()
+                    motion_detected = self._night_mode_motion_detection()
                 else:
-                    # Use a dedicated motion detection method for day mode ---
+                    # --- NEW: Use a dedicated motion detection method for day mode ---
                     motion_detected = self._day_mode_motion_detection()
 
                 # --- YOLO processing logic (remains the same) ---
@@ -289,115 +309,71 @@ class Camera:
                 self.running = False
         print("Processing loop has stopped.")
 
-    def _update_mode_by_time(self):
+    def _check_and_update_camera_mode(self):
         """
-        Mode maintenance based on sunrise/sunset. This consolidated version also
-        handles resetting the motion detection background to prevent false triggers.
+        Mode maintenance:
+          - NIGHT -> (stay) unless:
+              * whiteout fail-safe (super bright frame) => switch to DAY immediately
+              * OR within sunrise window -> do a 'peek' with AE+normal FR to test brightness
+          - DAY   -> switch to NIGHT if gain/exposure indicate darkness
         """
-        now_ts = time.time()
-        if now_ts - self._last_mode_switch_ts < 60.0:
+        now = time.time()
+
+        # Small dwell to avoid flapping near thresholds
+        if now - getattr(self, "_last_mode_switch_ts", 0.0) < 5.0:
             return
 
-        try:
-            tz = ZoneInfo(TIMEZONE)
-            now = datetime.now(tz)
+        frame_period_us = int(1e6 / FRAMERATE)
 
-            if self._sun_refresh_after and now >= self._sun_refresh_after:
-                print("[Sun] New day, refreshing sunrise/sunset times.")
-                self._refresh_sun_times()
-
-            day_starts = self._sunrise_today - timedelta(minutes=SUN_TRANSITION_MINUTES)
-            night_starts = self._sunset_today + timedelta(minutes=SUN_TRANSITION_MINUTES)
-
-            is_currently_daytime = day_starts <= now < night_starts
-
-            mode_changed = False
-            # Check if a switch to DAY mode is needed
-            if is_currently_daytime and self.is_night_mode:
-                print(f"[ModeCheck] Time ({now.strftime('%H:%M')}) is past day threshold. Switching to DAY.")
-                mode_changed = True
+        if self.is_night_mode:
+            # 1) Always-on whiteout fail-safe: blown-out frame => go DAY now
+            luma = self._estimate_scene_luma()  # must return 0..255 or None
+            if luma is not None and luma >= 220.0:
+                print(f"[ModeCheck] Night whiteout luma={luma:.1f} -> DAY")
                 self._enable_day_mode()
+                self._last_mode_switch_ts = now
+                return
 
-            # Check if a switch to NIGHT mode is needed
-            elif not is_currently_daytime and not self.is_night_mode:
-                print(f"[ModeCheck] Time ({now.strftime('%H:%M')}) is past night threshold. Switching to NIGHT.")
-                mode_changed = True
-                self._enable_night_mode()
+            # 2) Only 'peek' around sunrise
+            if not self._within_sunrise_window():   # must return True only near sunrise
+                return
 
-            # If a switch occurred, reset the background and pause
-            if mode_changed:
-                print("Mode switched. Resetting motion background and pausing for 2s to stabilize...")
+            # Peek cadence while in the sunrise window
+            if now - getattr(self, "_last_peek_ts", 0.0) > PEEK_INTERVAL_NEAR:
+                self._last_peek_ts = now
 
-                # 1. Reset background models directly
-                self.prev_lores_day_gray = None
-                self.prev_lores_night_gray = None
-                if hasattr(self, 'motion_history'):
-                    self.motion_history.clear()
+                # Temporarily restore AE + normal framerate so exposure collapses if bright
+                self.picam2.set_controls({
+                    "AeEnable": True,
+                    "AwbEnable": True,
+                    "FrameRate": FRAMERATE
+                })
+                time.sleep(0.5)  # quick settle
 
-                # 2. Update timestamp and pause
-                self._last_mode_switch_ts = now_ts
-                time.sleep(2.0) # Pause to let sensor settings stabilize
+                md = self.picam2.capture_metadata()
+                gain = float(md.get("AnalogueGain", 0.0))
+                exp_us = int(md.get("ExposureTime", 0))
 
-        except Exception as e:
-            print(f"[ModeCheck] Error during time-based mode check: {e}")
+                bright_enough = (gain < DAY_MODE_GAIN_THRESHOLD) and (exp_us < int(frame_period_us * 0.5))
+                print(f"[Peek @ sunrise] gain={gain:.2f}, exp={exp_us}us -> bright={bright_enough}")
 
-    def _night_mode_airplane_detection(self):
-        """
-        A specialized detector for finding small, bright objects (like airplanes) at night.
-        This version continuously tracks objects to ensure recording doesn't stop prematurely.
-        """
-        # --- Tuning Parameters --------------------------------------------------------------------------
-        BRIGHTNESS_THRESHOLD = 38
-        MAX_DISTANCE_PER_FRAME = 90
-        MIN_CONSECUTIVE_FRAMES = 3
-        MIN_SPOT_AREA = 2
-        MAX_SPOT_AREA = 500
+                if bright_enough:
+                    self._enable_day_mode()
+                    self._last_mode_switch_ts = now
+                else:
+                    # Still dark: revert to fixed long-exposure night settings
+                    self._enable_night_mode(force_revert=True)
 
-        with self.lock:
-            lores_gray = None if self.latest_lores_gray is None else self.latest_lores_gray.copy()
-        if lores_gray is None:
-            return False
+            return  # don't fall through to day logic
 
-        # 1. Find all potential bright spots in the current frame
-        _, thresh = cv2.threshold(lores_gray, BRIGHTNESS_THRESHOLD, 255, cv2.THRESH_BINARY)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        current_spots = []
-        for c in contours:
-            area = cv2.contourArea(c)
-            if MIN_SPOT_AREA <= area <= MAX_SPOT_AREA:
-                M = cv2.moments(c)
-                if M['m00'] > 0:
-                    cx = int(M['m10'] / M['m00'])
-                    cy = int(M['m01'] / M['m00'])
-                    current_spots.append({'pos': (cx, cy), 'track_len': 1})
-        
-        # 2. Compare with history to build tracks
-        if len(self.night_track_history) > 0:
-            prev_spots = self.night_track_history[-1]
-            for i in range(len(current_spots)):
-                for prev_spot in prev_spots:
-                    dist = np.linalg.norm(np.array(current_spots[i]['pos']) - np.array(prev_spot['pos']))
-                    if dist < MAX_DISTANCE_PER_FRAME:
-                        current_spots[i]['track_len'] = prev_spot['track_len'] + 1
-                        break
-        
-        self.night_track_history.append(current_spots)
-
-        # 3. Check if any track is long enough to be considered motion.
-        motion_found = False
-        for spot in current_spots:
-            # Only print the confirmation message ONCE when a track is first established.
-            if spot['track_len'] == MIN_CONSECUTIVE_FRAMES:
-                print(f"✔️ Confirmed new track of length {spot['track_len']} at {spot['pos']}.")
-            
-            # If any track is long enough, we consider it ongoing motion.
-            if spot['track_len'] >= MIN_CONSECUTIVE_FRAMES:
-                motion_found = True
-
-        # By NOT clearing the history, we allow tracks to persist frame after frame.
-        # This will continuously return True as long as the object is tracked.
-        return motion_found
+        # ---- DAY logic: switch to night when it's actually dark ----
+        md = self.picam2.capture_metadata()
+        gain = float(md.get("AnalogueGain", 0.0))
+        exp_us = int(md.get("ExposureTime", 0))
+        if (gain >= NIGHT_MODE_GAIN_THRESHOLD) or (exp_us >= int(frame_period_us * 0.9)):
+            print(f"[ModeCheck] Dark: gain={gain:.2f}, exp={exp_us}us -> NIGHT")
+            self._enable_night_mode()
+            self._last_mode_switch_ts = now
 
     def _enable_night_mode(self, force_revert=False):
         """Lock long exposure / high gain and low framerate for night viewing."""
@@ -420,7 +396,7 @@ class Camera:
             "AwbEnable": False,
             "ExposureTime": exposure_time_us,
             "AnalogueGain": float(NIGHT_ANALOGUE_GAIN),
-            "FrameRate": 1/NIGHT_EXPOSURE_SECONDS,  # allow long exposure
+            "FrameRate": 1.0,  # allow long exposure
         })
         self.is_night_mode = True
         if not force_revert:
@@ -439,45 +415,43 @@ class Camera:
 
     def _day_mode_motion_detection(self):
         """
-        Detects motion in day mode, now with more robust handling of the background state.
+        Detects motion in day mode using contour analysis with temporal consistency to ignore slow-moving clouds.
         """
         with self.lock:
             lores_gray = None if self.latest_lores_gray is None else self.latest_lores_gray.copy()
         if lores_gray is None:
             return False
-
-        lores_gray_blurred = cv2.GaussianBlur(lores_gray, (9, 9), 0)
-
-        # This check is now the key to handling the mode-switch reset.
-        # If the background is None (because it was just reset), we initialize it and exit for this frame.
-        if self.prev_lores_day_gray is None:
-            self.prev_lores_day_gray = lores_gray_blurred
-            self.motion_history.clear()
+        if not hasattr(self, 'prev_lores_day_gray'):
+            self.prev_lores_day_gray = cv2.GaussianBlur(lores_gray, (21, 21), 0)
+            self.motion_history = collections.deque(maxlen=3)  # Track last 3 frames for consistency
             return False
 
-        # If the background is valid, we proceed with motion detection.
-        frame_delta = cv2.absdiff(self.prev_lores_day_gray, lores_gray_blurred)
-        self.prev_lores_day_gray = lores_gray_blurred
-
-        if self.roi_mask is not None:
-            frame_delta = cv2.bitwise_and(frame_delta, frame_delta, mask=self.roi_mask)
-
-        thresh = cv2.threshold(frame_delta, 15, 255, cv2.THRESH_BINARY)[1]
+        lores_gray = cv2.GaussianBlur(lores_gray, (21, 21), 0)
+        frame_delta = cv2.absdiff(self.prev_lores_day_gray, lores_gray)
+        self.prev_lores_day_gray = lores_gray
+        thresh = cv2.threshold(frame_delta, 30, 255, cv2.THRESH_BINARY)[1]
         thresh = cv2.dilate(thresh, None, iterations=2)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        min_area = 2
+        min_area = 3
         max_area = 3000
+
         motion_detected = False
+        detected_area = None  # Store area of valid contour
         for c in contours:
-            if min_area < cv2.contourArea(c) < max_area:
+            area = cv2.contourArea(c)
+            if min_area < area < max_area:
                 motion_detected = True
+                detected_area = area  # Save area for printing
                 break
 
+        # Append motion detection result to history
         self.motion_history.append(motion_detected)
         
+        # Require motion in at least 2 out of 3 consecutive frames
         if len(self.motion_history) == self.motion_history.maxlen:
-            if sum(self.motion_history) >= 2:
+            consecutive_motion = sum(self.motion_history) >= 2
+            if consecutive_motion and detected_area is not None:
+                print(f"Day motion detected with contour area: {detected_area}")
                 return True
 
         return False
